@@ -167,18 +167,148 @@ def create_track(database, data):
     return get_track(database, cursor.lastrowid), None
 
 
-def find_conflicts(database, source):
-    rows = database.execute(
-        "SELECT id, title FROM tracks WHERE source = ? ORDER BY id ASC", (source,)
-    ).fetchall()
+def find_conflicts(database, source, exclude_id=None):
+    if exclude_id is not None:
+        rows = database.execute(
+            "SELECT id, title FROM tracks WHERE source = ? AND id != ? ORDER BY id ASC",
+            (source, exclude_id),
+        ).fetchall()
+    else:
+        rows = database.execute(
+            "SELECT id, title FROM tracks WHERE source = ? ORDER BY id ASC", (source,)
+        ).fetchall()
     return [{"id": row[0], "title": row[1]} for row in rows]
+
+
+def clean_patch_payload(data):
+    """校验并规整 PATCH 请求中明确提交的字段，返回只含这些字段的 dict。
+
+    未提交的字段由调用方合并旧值；任何不合法输入都抛 PayloadError，
+    且不会写入数据。
+    """
+    if not isinstance(data, dict):
+        raise PayloadError(None, "请求体必须是 JSON 对象")
+
+    clean = {}
+
+    if "title" in data:
+        title = data["title"]
+        if not isinstance(title, str):
+            raise PayloadError("title", "名称必须是字符串")
+        title = title.strip()
+        if not title:
+            raise PayloadError("title", "名称去掉首尾空白后不能为空")
+        clean["title"] = title
+
+    if "source" in data:
+        source = data["source"]
+        if source is None:
+            raise PayloadError("source", "来源不能清空；如不再收录该来源，请取消编辑")
+        if not isinstance(source, str):
+            raise PayloadError("source", "来源必须是字符串")
+        source = source.strip()
+        if not source:
+            raise PayloadError("source", "来源不能清空；如不再收录该来源，请取消编辑")
+        clean["source"] = source
+
+    if "duration" in data:
+        raw_duration = data["duration"]
+        if raw_duration is None:
+            duration = None
+        else:
+            if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+                raise PayloadError("duration", "时长必须是数字（秒），设为 null 表示未知")
+            if not math.isfinite(raw_duration):
+                raise PayloadError("duration", "时长必须是有限的非负数字（秒）")
+            if raw_duration < 0:
+                raise PayloadError("duration", "时长不能为负数（秒）")
+            duration = float(raw_duration)
+        clean["duration"] = duration
+
+    if "cover_url" in data:
+        cover_url = data["cover_url"]
+        if cover_url is None:
+            cover_url = ""
+        elif not isinstance(cover_url, str):
+            raise PayloadError("cover_url", "封面地址必须是字符串")
+        else:
+            cover_url = cover_url.strip()
+        clean["cover_url"] = cover_url
+
+    if "description" in data:
+        description = data["description"]
+        if description is None:
+            description = ""
+        elif not isinstance(description, str):
+            raise PayloadError("description", "说明必须是字符串")
+        # 保留用户输入原文，包括换行与首尾空白。
+        clean["description"] = description
+
+    if "tags" in data:
+        raw_tags = data["tags"]
+        if raw_tags is None:
+            raw_tags = []
+        if not isinstance(raw_tags, list):
+            raise PayloadError("tags", "标签必须是字符串数组")
+        tags = []
+        seen = set()
+        for item in raw_tags:
+            if not isinstance(item, str):
+                raise PayloadError("tags", "标签中的每一项都必须是字符串")
+            tag = item.strip()
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append(tag)
+        clean["tags"] = tags
+
+    return clean
+
+
+def update_track(database, track_id, data):
+    """校验并更新一条曲目。返回 (record, conflicts)。
+
+    曲目不存在时返回 (None, "not_found")；来源改成其他曲目已使用的
+    文字时返回 (None, conflicts)；成功时 conflicts 为 None。
+    """
+    record = get_track(database, track_id)
+    if record is None:
+        return None, "not_found"
+
+    clean = clean_patch_payload(data)
+
+    new_source = clean.get("source", record["source"])
+    # 来源未改变（包括旧记录继续缺失来源）时不判重；
+    # 确实改成另一段文字时，排除自身后检查是否与其他曲目冲突。
+    if new_source is not None and new_source != record["source"]:
+        conflicts = find_conflicts(database, new_source, exclude_id=track_id)
+        if conflicts:
+            return None, conflicts
+
+    assignments = []
+    params = {"id": track_id}
+    for field in ("title", "source", "duration", "cover_url", "description", "tags"):
+        if field not in clean:
+            continue
+        value = clean[field]
+        if field == "tags":
+            value = json.dumps(value, ensure_ascii=False)
+        assignments.append(f"{field} = :{field}")
+        params[field] = value
+
+    if assignments:
+        database.execute(
+            f"UPDATE tracks SET {', '.join(assignments)} WHERE id = :id", params
+        )
+        database.commit()
+    return get_track(database, track_id), None
 
 
 def get_track(database, track_id):
     row = database.execute(
         f"SELECT {TRACK_COLUMNS} FROM tracks WHERE id = ?", (track_id,)
     ).fetchone()
-    return record_from_row(row)
+    return record_from_row(row) if row is not None else None
 
 
 def list_tracks(database):
@@ -226,15 +356,76 @@ def format_duration(value):
     return f"{text} 秒"
 
 
+def duration_to_text(value):
+    """把时长数字转成表单里可回填的文本。"""
+    if value is None:
+        return ""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
 FORM_FIELDS = ("title", "source", "duration", "cover_url", "description", "tags")
 
 
-def render_page(tracks, *, form=None, error=None, error_field=None,
-                conflicts=None, highlight=None):
-    form = form or {}
+def render_track_form(form, error, error_field, *, action, submit_label,
+                      edit_mode=False):
+    """渲染收录/编辑共用的曲目表单。
 
+    edit_mode 时不显示“另存为新版本”勾选框，并提供取消链接。
+    """
     def value(name):
         return esc(form.get(name, ""))
+
+    def inline_error(name):
+        if error_field == name:
+            return f'<p class="field-error">{esc(error)}</p>'
+        return ""
+
+    checkbox = ""
+    if not edit_mode:
+        checked = "checked" if form.get("save_as_new_version") else ""
+        checkbox = (
+            '<div class="checkbox-line">\n'
+            '  <input type="checkbox" id="f-force" name="save_as_new_version" '
+            f'value="1" {checked}>\n'
+            '  <label for="f-force">即使该来源已存在，仍将本次填写'
+            '<strong>另存为新版本</strong></label>\n'
+            '</div>\n'
+            f'  {inline_error("save_as_new_version")}\n'
+        )
+
+    cancel = ""
+    if edit_mode:
+        cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
+
+    return f'''<form class="track-form" method="post" action="{esc(action)}" novalidate>
+  <label for="f-title">名称 <span class="hint">（必填）</span></label>
+  <input type="text" id="f-title" name="title" value="{value("title")}">
+  {inline_error("title")}
+  <label for="f-source">来源 <span class="hint">（必填，网址或本地文件路径，按文字原样保存，不检查能否播放）</span></label>
+  <input type="text" id="f-source" name="source" value="{value("source")}">
+  {inline_error("source")}
+  <label for="f-duration">时长 <span class="hint">（秒，可留空表示未知；允许 0 和小数）</span></label>
+  <input type="text" id="f-duration" name="duration" inputmode="decimal" value="{value("duration")}">
+  {inline_error("duration")}
+  <label for="f-cover-url">封面地址 <span class="hint">（可留空，不会检查远端文件）</span></label>
+  <input type="text" id="f-cover-url" name="cover_url" value="{value("cover_url")}">
+  {inline_error("cover_url")}
+  <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
+  <textarea id="f-description" name="description">{esc(form.get("description", ""))}</textarea>
+  {inline_error("description")}
+  <label for="f-tags">标签 <span class="hint">（可留空，多个标签用逗号分隔；自动去重）</span></label>
+  <input type="text" id="f-tags" name="tags" value="{value("tags")}">
+  {inline_error("tags")}
+  {checkbox}<button type="submit">{esc(submit_label)}</button>
+  {cancel}</form>'''
+
+
+def render_page(tracks, *, form=None, error=None, error_field=None,
+                conflicts=None, highlight=None, edit_track=None,
+                edit_not_found=None, edited=False):
+    form = form or {}
+    edit_mode = edit_track is not None
 
     error_html = ""
     if error:
@@ -246,21 +437,44 @@ def render_page(tracks, *, form=None, error=None, error_field=None,
             f'<li><span class="track-id">#{item["id"]}</span> {esc(item["title"])}</li>'
             for item in conflicts
         )
-        conflict_html = (
-            '<div class="banner conflict" role="alert">'
-            "<p><strong>该来源已经收录过曲目，默认不会重复新增。</strong>"
-            "已有记录如下，请辨认是否是同一首：</p>"
-            f'<ul class="conflict-list">{items}</ul>'
-            "<p>如果这是同一来源的另一个版本（例如不同码率或重新上传），"
-            "请勾选下方“另存为新版本”后再次保存，已有记录不会被修改。</p>"
-            "</div>"
-        )
+        if edit_mode:
+            conflict_html = (
+                '<div class="banner conflict" role="alert">'
+                "<p><strong>该来源已被其他曲目使用，无法保存。</strong>"
+                "已有记录如下：</p>"
+                f'<ul class="conflict-list">{items}</ul>'
+                "<p>请修改来源后重试；如需保留该来源，请取消编辑，"
+                "使用收录功能另存为新版本。</p>"
+                "</div>"
+            )
+        else:
+            conflict_html = (
+                '<div class="banner conflict" role="alert">'
+                "<p><strong>该来源已经收录过曲目，默认不会重复新增。</strong>"
+                "已有记录如下，请辨认是否是同一首：</p>"
+                f'<ul class="conflict-list">{items}</ul>'
+                "<p>如果这是同一来源的另一个版本（例如不同码率或重新上传），"
+                "请勾选下方“另存为新版本”后再次保存，已有记录不会被修改。</p>"
+                "</div>"
+            )
 
-    checked = "checked" if form.get("save_as_new_version") else ""
-    inline_error = (
-        lambda name: f'<p class="field-error">{esc(error)}</p>'
-        if error_field == name else ""
-    )
+    if edit_mode:
+        form_html = render_track_form(
+            form, error, error_field,
+            action=f"/tracks/{edit_track['id']}/edit",
+            submit_label="保存修改",
+            edit_mode=True,
+        )
+        form_heading = (
+            f'<h2>编辑曲目 <span class="track-id">#{edit_track["id"]}</span></h2>'
+        )
+    else:
+        form_html = render_track_form(
+            form, error, error_field,
+            action="/",
+            submit_label="保存曲目",
+        )
+        form_heading = '<h2 id="add">手动收录曲目</h2>'
 
     if tracks:
         items = "".join(render_track(record, highlight) for record in tracks)
@@ -273,9 +487,22 @@ def render_page(tracks, *, form=None, error=None, error_field=None,
 
     highlight_notice = ""
     if highlight is not None:
-        highlight_notice = (
-            f'<p class="banner success">收录成功，曲目 <strong>#{highlight}</strong> '
-            "已加入下方列表。</p>"
+        if edited:
+            highlight_notice = (
+                f'<p class="banner success">修改成功，曲目 <strong>#{highlight}</strong> '
+                "的资料已更新，已在下方列表中显示。</p>"
+            )
+        else:
+            highlight_notice = (
+                f'<p class="banner success">收录成功，曲目 <strong>#{highlight}</strong> '
+                "已加入下方列表。</p>"
+            )
+
+    not_found_html = ""
+    if edit_not_found is not None:
+        not_found_html = (
+            f'<p class="banner error" role="alert">曲目 '
+            f'<strong>#{edit_not_found}</strong> 不存在，无法编辑。</p>'
         )
 
     return f"""<!doctype html>
@@ -299,6 +526,7 @@ form.track-form input[type=text],form.track-form textarea{{width:100%;box-sizing
 form.track-form textarea{{min-height:5.5rem;resize:vertical}}
 .field-error{{color:#b3261e;margin:.25rem 0 0;font-size:.92em}}
 form.track-form button{{margin-top:1.1rem;padding:.5rem 1.2rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#1769aa;color:#fff;cursor:pointer}}
+.form-cancel{{margin:.6rem 0 0;font-size:.95em}}
 .checkbox-line{{margin-top:1rem}}
 .checkbox-line label{{display:inline;font-weight:400}}
 ol.tracks{{list-style:none;padding:0;display:flex;flex-direction:column;gap:1rem}}
@@ -312,40 +540,17 @@ ol.tracks li.highlight{{border-color:#1769aa;box-shadow:0 0 0 2px rgba(23,105,17
 .notes{{white-space:pre-wrap;word-break:normal}}
 .unfilled{{color:#829ab1}}
 .tag{{display:inline-block;background:#e4e7eb;border-radius:999px;padding:.05rem .7rem;margin:.1rem .25rem .1rem 0;font-size:.88em}}
+.track-actions{{margin:.6rem 0 0;font-size:.95em}}
 </style>
 <main>
 <h1>{PRODUCT}</h1>
 <p>音频曲目与播放清单</p>
 {highlight_notice}
-<h2 id="add">手动收录曲目</h2>
+{not_found_html}
+{form_heading}
 {conflict_html}
 {error_html}
-<form class="track-form" method="post" action="/" novalidate>
-  <label for="f-title">名称 <span class="hint">（必填）</span></label>
-  <input type="text" id="f-title" name="title" value="{value("title")}">
-  {inline_error("title")}
-  <label for="f-source">来源 <span class="hint">（必填，网址或本地文件路径，按文字原样保存，不检查能否播放）</span></label>
-  <input type="text" id="f-source" name="source" value="{value("source")}">
-  {inline_error("source")}
-  <label for="f-duration">时长 <span class="hint">（秒，可留空表示未知；允许 0 和小数）</span></label>
-  <input type="text" id="f-duration" name="duration" inputmode="decimal" value="{value("duration")}">
-  {inline_error("duration")}
-  <label for="f-cover-url">封面地址 <span class="hint">（可留空，不会检查远端文件）</span></label>
-  <input type="text" id="f-cover-url" name="cover_url" value="{value("cover_url")}">
-  {inline_error("cover_url")}
-  <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
-  <textarea id="f-description" name="description">{esc(form.get("description", ""))}</textarea>
-  {inline_error("description")}
-  <label for="f-tags">标签 <span class="hint">（可留空，多个标签用逗号分隔；自动去重）</span></label>
-  <input type="text" id="f-tags" name="tags" value="{value("tags")}">
-  {inline_error("tags")}
-  <div class="checkbox-line">
-    <input type="checkbox" id="f-force" name="save_as_new_version" value="1" {checked}>
-    <label for="f-force">即使该来源已存在，仍将本次填写<strong>另存为新版本</strong></label>
-  </div>
-  {inline_error("save_as_new_version")}
-  <button type="submit">保存曲目</button>
-</form>
+{form_html}
 <h2>曲目列表</h2>
 {listing}
 <p><a href="/api/tracks">查看曲目列表接口</a> · <a href="/health">服务状态</a></p>
@@ -390,6 +595,7 @@ def render_track(record, highlight=None):
 <dt>标签</dt><dd>{tags_cell}</dd>
 <dt>说明</dt><dd class="notes">{notes_cell}</dd>
 </dl>
+<p class="track-actions"><a href="/tracks/{record["id"]}/edit">编辑这条曲目</a></p>
 </li>"""
 
 
@@ -457,13 +663,15 @@ def main():
                 length = 0
             return self.rfile.read(max(length, 0))
 
-        def error_page(self, status, message, form, *, field=None, conflicts=None):
+        def error_page(self, status, message, form, *, field=None, conflicts=None,
+                       edit_track=None):
             page = render_page(
                 list_tracks(database),
                 form=form,
                 error=message,
                 error_field=field,
                 conflicts=conflicts,
+                edit_track=edit_track,
             )
             self.respond(status, page, html=True)
 
@@ -472,7 +680,12 @@ def main():
             raw_highlight = query.get("highlight", [""])[0]
             if raw_highlight.isdigit():
                 highlight = int(raw_highlight)
-            self.respond(200, render_page(list_tracks(database), highlight=highlight), html=True)
+            edited = query.get("edited", [""])[0] in ("1", "true", "yes")
+            self.respond(
+                200,
+                render_page(list_tracks(database), highlight=highlight, edited=edited),
+                html=True,
+            )
 
         def handle_page_post(self):
             raw = self.read_body().decode("utf-8", errors="replace")
@@ -536,9 +749,133 @@ def main():
                 return
             self.respond(201, record)
 
+        def handle_edit_get(self, track_id):
+            record = get_track(database, track_id)
+            if record is None:
+                page = render_page(list_tracks(database), edit_not_found=track_id)
+                self.respond(404, page, html=True)
+                return
+            form = {
+                "title": record["title"],
+                "source": record["source"] or "",
+                "duration": duration_to_text(record["duration"]),
+                "cover_url": record["cover_url"],
+                "description": record["description"],
+                "tags": ", ".join(record["tags"]),
+            }
+            self.respond(
+                200,
+                render_page(list_tracks(database), form=form, edit_track=record),
+                html=True,
+            )
+
+        def handle_edit_post(self, track_id):
+            record = get_track(database, track_id)
+            if record is None:
+                page = render_page(list_tracks(database), edit_not_found=track_id)
+                self.respond(404, page, html=True)
+                return
+            raw = self.read_body().decode("utf-8", errors="replace")
+            form = parse_qs(raw, keep_blank_values=True)
+            form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
+            try:
+                payload = form_to_payload(form)
+                # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
+                # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
+                if record["source"] is None and not payload["source"].strip():
+                    del payload["source"]
+                updated, conflicts = update_track(database, track_id, payload)
+            except PayloadError as exc:
+                self.error_page(
+                    400,
+                    f"保存失败：{FIELD_LABELS.get(exc.field, '输入')}有误——{exc.message}",
+                    form_view,
+                    field=exc.field,
+                    edit_track=record,
+                )
+                return
+            if conflicts is not None:
+                self.error_page(
+                    409,
+                    "保存失败：该来源已被其他曲目使用，请修改来源后重试。",
+                    form_view,
+                    field="source",
+                    conflicts=conflicts,
+                    edit_track=record,
+                )
+                return
+            self.respond(
+                303,
+                "",
+                html=True,
+                extra_headers=[("Location", f"/?highlight={track_id}&edited=1")],
+            )
+
+        def handle_api_patch(self, track_id):
+            raw = self.read_body()
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.respond(400, {"error": "请求体不是有效的 JSON"})
+                return
+            try:
+                record, conflicts = update_track(database, track_id, data)
+            except PayloadError as exc:
+                label = FIELD_LABELS.get(exc.field)
+                message = f"{label}有误：{exc.message}" if label else exc.message
+                self.respond(400, {"error": message, "field": exc.field})
+                return
+            if record is None:
+                if conflicts == "not_found":
+                    self.respond(404, {"error": f"曲目 #{track_id} 不存在"})
+                else:
+                    self.respond(
+                        409,
+                        {
+                            "error": "该来源已被其他曲目使用；请修改来源后重试，或取消编辑后另存新版本",
+                            "field": "source",
+                            "existing": conflicts,
+                        },
+                    )
+                return
+            self.respond(200, record)
+
         def route(self):
             location = urlsplit(self.path)
             path = location.path
+            query = parse_qs(location.query)
+
+            # 编辑曲目页面：/tracks/{id}/edit
+            edit_match = re.fullmatch(r"/tracks/(\d+)/edit", path)
+            if edit_match:
+                track_id = int(edit_match.group(1))
+                if self.command not in ("GET", "POST"):
+                    self.respond(
+                        405,
+                        {"error": "method not allowed"},
+                        extra_headers=[("Allow", "GET, POST")],
+                    )
+                    return
+                if self.command == "GET":
+                    self.handle_edit_get(track_id)
+                else:
+                    self.handle_edit_post(track_id)
+                return
+
+            # PATCH 曲目资料：/api/tracks/{id}
+            api_match = re.fullmatch(r"/api/tracks/(\d+)", path)
+            if api_match:
+                track_id = int(api_match.group(1))
+                if self.command != "PATCH":
+                    self.respond(
+                        405,
+                        {"error": "method not allowed"},
+                        extra_headers=[("Allow", "PATCH")],
+                    )
+                    return
+                self.handle_api_patch(track_id)
+                return
+
             if path not in ("/", "/health", "/api/tracks"):
                 self.respond(404, {"error": "not found"})
                 return
@@ -557,7 +894,7 @@ def main():
                 self.respond(200, {"status": "ok", "product": PRODUCT})
             elif path == "/":
                 if self.command == "GET":
-                    self.handle_page_get(parse_qs(location.query))
+                    self.handle_page_get(query)
                 else:
                     self.handle_page_post()
             elif self.command == "GET":
