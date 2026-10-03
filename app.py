@@ -398,6 +398,37 @@ def render_track_form(form, error, error_field, *, action, submit_label,
     if edit_mode:
         cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
 
+    if edit_mode:
+        # 编辑页每行一个标签：标签文字中的逗号、顿号等标点原样保留，
+        # 不会被当作分隔符；清空某一行即删除该标签，在空行填写即新增。
+        existing_tags = form.get("tags", [])
+        if not isinstance(existing_tags, list):
+            existing_tags = [existing_tags]
+        tag_inputs = []
+        for index, tag in enumerate(existing_tags, start=1):
+            tag_inputs.append(
+                f'<input type="text" class="tag-input" name="tag" '
+                f'value="{esc(tag)}" aria-label="标签 {index}">'
+            )
+        for _ in range(3):
+            tag_inputs.append(
+                '<input type="text" class="tag-input" name="tag" value="" '
+                'placeholder="（空行，可填写新标签）" aria-label="新增标签">'
+            )
+        tags_field = (
+            '<span class="field-label">标签 <span class="hint">（每行一个标签，'
+            "标签里的逗号、顿号等标点会原样保留，不会被拆开；清空某一行即删除该标签，"
+            "在空行填写即新增标签；保存时自动去掉首尾空白、忽略空行，"
+            '相同文字只保留第一次出现）</span></span>\n'
+            + "\n".join(tag_inputs)
+        )
+    else:
+        tags_field = (
+            '<label for="f-tags">标签 <span class="hint">（可留空，'
+            '多个标签用逗号分隔；自动去重）</span></label>\n'
+            f'  <input type="text" id="f-tags" name="tags" value="{value("tags")}">'
+        )
+
     return f'''<form class="track-form" method="post" action="{esc(action)}" novalidate>
   <label for="f-title">名称 <span class="hint">（必填）</span></label>
   <input type="text" id="f-title" name="title" value="{value("title")}">
@@ -414,8 +445,7 @@ def render_track_form(form, error, error_field, *, action, submit_label,
   <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
   <textarea id="f-description" name="description">{esc(form.get("description", ""))}</textarea>
   {inline_error("description")}
-  <label for="f-tags">标签 <span class="hint">（可留空，多个标签用逗号分隔；自动去重）</span></label>
-  <input type="text" id="f-tags" name="tags" value="{value("tags")}">
+  {tags_field}
   {inline_error("tags")}
   {checkbox}<button type="submit">{esc(submit_label)}</button>
   {cancel}</form>'''
@@ -521,6 +551,8 @@ h2{{margin-top:2.5rem;border-bottom:1px solid #d9e2ec;padding-bottom:.3rem}}
 .conflict-list{{margin:.4rem 0}}
 form.track-form{{border:1px solid #d9e2ec;border-radius:8px;padding:1rem 1.25rem;background:#f8fafc}}
 form.track-form label{{display:block;font-weight:600;margin-top:.8rem}}
+form.track-form .field-label{{display:block;font-weight:600;margin-top:.8rem}}
+form.track-form input.tag-input{{display:block;margin-top:.3rem}}
 form.track-form .hint{{font-weight:400;color:#627d98;font-size:.9em}}
 form.track-form input[type=text],form.track-form textarea{{width:100%;box-sizing:border-box;padding:.45rem .6rem;border:1px solid #bcccdc;border-radius:4px;font:inherit}}
 form.track-form textarea{{min-height:5.5rem;resize:vertical}}
@@ -602,8 +634,13 @@ def render_track(record, highlight=None):
 render_track.highlight = None
 
 
-def form_to_payload(form):
-    """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。"""
+def form_to_payload(form, *, split_tags=True):
+    """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。
+
+    split_tags 为 True 时（首页手动收录），标签按中英文逗号和顿号分隔；
+    为 False 时（编辑页），表单中每个 name="tag" 的输入行就是一个完整标签，
+    行内的逗号、顿号等标点原样保留，不会被拆开。
+    """
     def one(name):
         return form.get(name, [""])[0]
 
@@ -618,14 +655,18 @@ def form_to_payload(form):
                 "duration", "时长必须是有限的非负数字（秒），留空表示未知"
             )
 
+    if split_tags:
+        tags = [part for part in re.split(r"[,，、]+", one("tags"))]
+    else:
+        tags = list(form.get("tag", []))
+
     payload = {
         "title": one("title"),
         "source": one("source"),
         "duration": duration,
         "cover_url": one("cover_url"),
         "description": one("description"),
-        # 标签按中英文逗号和顿号分隔，后续规则与接口一致。
-        "tags": [part for part in re.split(r"[,，、]+", one("tags"))],
+        "tags": tags,
         "save_as_new_version": one("save_as_new_version") in ("1", "on", "true", "yes"),
     }
     return payload
@@ -761,7 +802,8 @@ def main():
                 "duration": duration_to_text(record["duration"]),
                 "cover_url": record["cover_url"],
                 "description": record["description"],
-                "tags": ", ".join(record["tags"]),
+                # 每个标签占一行，标签内的标点原样保留，不拼接、不拆分。
+                "tags": list(record["tags"]),
             }
             self.respond(
                 200,
@@ -778,8 +820,11 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
+            # 校验失败或来源冲突时，按用户这次填写的逐行标签重新渲染，
+            # 保留每个标签的文字与边界。
+            form_view["tags"] = form.get("tag", [])
             try:
-                payload = form_to_payload(form)
+                payload = form_to_payload(form, split_tags=False)
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
                 # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
                 if record["source"] is None and not payload["source"].strip():
