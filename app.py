@@ -398,6 +398,26 @@ def render_track_form(form, error, error_field, *, action, submit_label,
     if edit_mode:
         cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
 
+    if edit_mode:
+        # 编辑页每行一个标签：标签文字里的逗号、顿号等标点原样保留，
+        # 不会被当作分隔符；不改动标签时保存，文字、边界和顺序都不变。
+        tags_field = (
+            '<label for="f-tags">标签 <span class="hint">（可留空，'
+            '<strong>每行一个标签</strong>；标签内的逗号、顿号等标点会原样保留，'
+            '不会被拆开。修改某一行的文字即修改该标签；增加一行即新增标签；'
+            '删除某一行即删除该标签；全部删空则保存为无标签。'
+            '每行自动去掉首尾空白、忽略空行、相同文字只保留第一次出现）</span></label>\n'
+            f'  <textarea id="f-tags" name="tags" rows="4">{esc(form.get("tags", ""))}</textarea>\n'
+            f'  {inline_error("tags")}'
+        )
+    else:
+        tags_field = (
+            '<label for="f-tags">标签 <span class="hint">（可留空，'
+            '多个标签用逗号分隔；自动去重）</span></label>\n'
+            f'  <input type="text" id="f-tags" name="tags" value="{value("tags")}">\n'
+            f'  {inline_error("tags")}'
+        )
+
     return f'''<form class="track-form" method="post" action="{esc(action)}" novalidate>
   <label for="f-title">名称 <span class="hint">（必填）</span></label>
   <input type="text" id="f-title" name="title" value="{value("title")}">
@@ -414,9 +434,7 @@ def render_track_form(form, error, error_field, *, action, submit_label,
   <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
   <textarea id="f-description" name="description">{esc(form.get("description", ""))}</textarea>
   {inline_error("description")}
-  <label for="f-tags">标签 <span class="hint">（可留空，多个标签用逗号分隔；自动去重）</span></label>
-  <input type="text" id="f-tags" name="tags" value="{value("tags")}">
-  {inline_error("tags")}
+  {tags_field}
   {checkbox}<button type="submit">{esc(submit_label)}</button>
   {cancel}</form>'''
 
@@ -602,8 +620,13 @@ def render_track(record, highlight=None):
 render_track.highlight = None
 
 
-def form_to_payload(form):
-    """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。"""
+def form_to_payload(form, *, edit_mode=False):
+    """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。
+
+    edit_mode 时标签按行拆分（编辑页每行一个标签，标签内的逗号、
+    顿号等标点原样保留）；否则按中英文逗号和顿号分隔，
+    后续规则与接口一致。
+    """
     def one(name):
         return form.get(name, [""])[0]
 
@@ -618,14 +641,18 @@ def form_to_payload(form):
                 "duration", "时长必须是有限的非负数字（秒），留空表示未知"
             )
 
+    if edit_mode:
+        tags = one("tags").splitlines()
+    else:
+        tags = [part for part in re.split(r"[,，、]+", one("tags"))]
+
     payload = {
         "title": one("title"),
         "source": one("source"),
         "duration": duration,
         "cover_url": one("cover_url"),
         "description": one("description"),
-        # 标签按中英文逗号和顿号分隔，后续规则与接口一致。
-        "tags": [part for part in re.split(r"[,，、]+", one("tags"))],
+        "tags": tags,
         "save_as_new_version": one("save_as_new_version") in ("1", "on", "true", "yes"),
     }
     return payload
@@ -761,7 +788,8 @@ def main():
                 "duration": duration_to_text(record["duration"]),
                 "cover_url": record["cover_url"],
                 "description": record["description"],
-                "tags": ", ".join(record["tags"]),
+                # 每行一个标签，保留各标签的完整文字、边界和顺序。
+                "tags": "\n".join(record["tags"]),
             }
             self.respond(
                 200,
@@ -779,7 +807,7 @@ def main():
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
             try:
-                payload = form_to_payload(form)
+                payload = form_to_payload(form, edit_mode=True)
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
                 # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
                 if record["source"] is None and not payload["source"].strip():
