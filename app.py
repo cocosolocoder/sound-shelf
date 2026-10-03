@@ -399,15 +399,33 @@ def render_track_form(form, error, error_field, *, action, submit_label,
         cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
 
     if edit_mode:
-        # 编辑页每行一个标签：标签文字里的逗号、顿号等标点原样保留，
-        # 不会被当作分隔符；不改动标签时保存，文字、边界和顺序都不变。
+        # 编辑页每个标签一项：每项一个输入框，标签内部的换行原样保留在
+        # 该项的输入框里，不会与项与项之间的边界混淆；标签文字里的逗号、
+        # 顿号等标点也原样保留。不改动标签时保存，文字、边界和顺序都不变。
+        tag_items = form.get("tag_items", [])
+        if not tag_items:
+            tag_items = [""]
+        item_rows = []
+        for text in tag_items:
+            item_rows.append(
+                '<div class="tag-item">\n'
+                '  <textarea name="tags" rows="2" '
+                'aria-label="标签文字（一项内部可以换行）">'
+                f'{esc(text)}</textarea>\n'
+                '  <button type="button" class="tag-remove">删除这一项</button>\n'
+                '</div>'
+            )
         tags_field = (
-            '<label for="f-tags">标签 <span class="hint">（可留空，'
-            '<strong>每行一个标签</strong>；标签内的逗号、顿号等标点会原样保留，'
-            '不会被拆开。修改某一行的文字即修改该标签；增加一行即新增标签；'
-            '删除某一行即删除该标签；全部删空则保存为无标签。'
-            '每行自动去掉首尾空白、忽略空行、相同文字只保留第一次出现）</span></label>\n'
-            f'  <textarea id="f-tags" name="tags" rows="4">{esc(form.get("tags", ""))}</textarea>\n'
+            '<label>标签 <span class="hint">（可全部删空；'
+            '<strong>每个输入框是一个标签项</strong>，一项内部可以换行，'
+            '逗号、顿号等标点一律按原文保留，不会被当作分隔符。'
+            '只修改某一项的文字、添加或删除一项都只影响明确改动的项，'
+            '保留下来的项维持原先的先后关系；全部删空则保存为无标签。'
+            '每项自动去掉首尾空白、忽略空项、完全相同的标签只保留第一次出现）'
+            '</span></label>\n'
+            f'  <div class="tag-items" id="f-tags">{"".join(item_rows)}</div>\n'
+            '  <p class="tag-add"><button type="button" id="tag-add">'
+            "添加一项标签</button></p>\n"
             f'  {inline_error("tags")}'
         )
     else:
@@ -558,6 +576,12 @@ ol.tracks li.highlight{{border-color:#1769aa;box-shadow:0 0 0 2px rgba(23,105,17
 .notes{{white-space:pre-wrap;word-break:normal}}
 .unfilled{{color:#829ab1}}
 .tag{{display:inline-block;background:#e4e7eb;border-radius:999px;padding:.05rem .7rem;margin:.1rem .25rem .1rem 0;font-size:.88em}}
+.tag-items{{display:flex;flex-direction:column;gap:.5rem;margin-top:.2rem}}
+.tag-item{{display:flex;gap:.5rem;align-items:flex-start}}
+.tag-item textarea{{flex:1;min-height:3.2rem;resize:vertical}}
+.tag-item .tag-remove{{margin-top:.25rem;padding:.35rem .8rem;font:inherit;font-size:.9em;border-radius:5px;border:1px solid #bcccdc;background:#fff;color:#b3261e;cursor:pointer;white-space:nowrap}}
+.tag-add{{margin:.5rem 0 0}}
+.tag-add button{{padding:.4rem 1rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#fff;color:#1769aa;cursor:pointer}}
 .track-actions{{margin:.6rem 0 0;font-size:.95em}}
 </style>
 <main>
@@ -573,6 +597,36 @@ ol.tracks li.highlight{{border-color:#1769aa;box-shadow:0 0 0 2px rgba(23,105,17
 {listing}
 <p><a href="/api/tracks">查看曲目列表接口</a> · <a href="/health">服务状态</a></p>
 </main>
+<script>
+(function () {{
+  var box = document.querySelector('.tag-items');
+  if (!box) return;
+  function newItem() {{
+    var wrap = document.createElement('div');
+    wrap.className = 'tag-item';
+    var area = document.createElement('textarea');
+    area.setAttribute('name', 'tags');
+    area.setAttribute('rows', '2');
+    area.setAttribute('aria-label', '标签文字（一项内部可以换行）');
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tag-remove';
+    button.textContent = '删除这一项';
+    wrap.appendChild(area);
+    wrap.appendChild(button);
+    return wrap;
+  }}
+  document.addEventListener('click', function (event) {{
+    if (event.target.id === 'tag-add') {{
+      var item = newItem();
+      box.appendChild(item);
+      item.querySelector('textarea').focus();
+    }} else if (event.target.classList.contains('tag-remove')) {{
+      event.target.closest('.tag-item').remove();
+    }}
+  }});
+}})();
+</script>
 </html>"""
 
 
@@ -625,8 +679,8 @@ render_track.highlight = None
 def form_to_payload(form, *, edit_mode=False):
     """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。
 
-    edit_mode 时标签按行拆分（编辑页每行一个标签，标签内的逗号、
-    顿号等标点原样保留）；否则按中英文逗号和顿号分隔，
+    edit_mode 时每个标签项是一个独立的 tags 字段（一项内部可以换行，
+    标签内的逗号、顿号等标点原样保留）；否则按中英文逗号和顿号分隔，
     后续规则与接口一致。
     """
     def one(name):
@@ -644,7 +698,13 @@ def form_to_payload(form, *, edit_mode=False):
             )
 
     if edit_mode:
-        tags = one("tags").splitlines()
+        # 每个 tags 字段就是一个标签项；内部换行、逗号、顿号都原样保留。
+        # 浏览器提交时会把输入框内的换行规范成 CRLF，统一折回 LF，
+        # 保证含换行的标签打开后原样保存，不改变内部文字。
+        tags = [
+            part.replace("\r\n", "\n").replace("\r", "\n")
+            for part in form.get("tags", [])
+        ]
     else:
         tags = [part for part in re.split(r"[,，、]+", one("tags"))]
 
@@ -790,8 +850,8 @@ def main():
                 "duration": duration_to_text(record["duration"]),
                 "cover_url": record["cover_url"],
                 "description": record["description"],
-                # 每行一个标签，保留各标签的完整文字、边界和顺序。
-                "tags": "\n".join(record["tags"]),
+                # 每个标签一项，各项的完整文字（含内部换行）、边界和顺序原样回填。
+                "tag_items": list(record["tags"]),
             }
             self.respond(
                 200,
@@ -808,6 +868,9 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
+            # 每个 tags 字段对应一个标签项，保存失败回填时保留各项的
+            # 完整文字（含内部换行）、边界与顺序，便于修正后继续保存。
+            form_view["tag_items"] = list(form.get("tags", []))
             try:
                 payload = form_to_payload(form, edit_mode=True)
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
