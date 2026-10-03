@@ -583,26 +583,30 @@ def render_track(record, highlight=None):
     def unfilled(text="未填写"):
         return f'<span class="unfilled">{text}</span>'
 
+    # 旧记录缺少来源时，只有来源保持未填写；其余字段按已保存的实际值展示。
     if legacy:
         source_cell = unfilled()
-        duration_cell = unfilled()
-        cover_cell = unfilled()
-        notes_cell = unfilled()
-        tags_cell = unfilled("无")
     else:
         source_cell = esc(record["source"])
-        if record["duration"] is None:
-            duration_cell = unfilled("未知")
-        else:
-            duration_cell = esc(format_duration(record["duration"]))
-        cover_cell = esc(record["cover_url"]) if record["cover_url"] else unfilled()
+
+    if record["duration"] is None:
+        duration_cell = unfilled() if legacy else unfilled("未知")
+    else:
+        duration_cell = esc(format_duration(record["duration"]))
+
+    cover_cell = esc(record["cover_url"]) if record["cover_url"] else unfilled()
+
+    if record["description"]:
         notes_cell = esc(record["description"])
-        if record["tags"]:
-            tags_cell = "".join(
-                f'<span class="tag">{esc(tag)}</span>' for tag in record["tags"]
-            )
-        else:
-            tags_cell = unfilled("无")
+    else:
+        notes_cell = unfilled() if legacy else esc(record["description"])
+
+    if record["tags"]:
+        tags_cell = "".join(
+            f'<span class="tag">{esc(tag)}</span>' for tag in record["tags"]
+        )
+    else:
+        tags_cell = unfilled("无")
 
     return f"""<li id="track-{record["id"]}"{highlighted}>
 <p class="track-title"><span class="track-id">#{record["id"]}</span>{esc(record["title"])}</p>
