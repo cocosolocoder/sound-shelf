@@ -56,61 +56,74 @@ def connect_database(path: Path) -> sqlite3.Connection:
     return database
 
 
-def clean_payload(data):
-    """校验并规整一份曲目资料，返回可直接入库的 dict。
+# ---------------------------------------------------------------------------
+# 字段级校验与规整：收录与编辑共用同一套规则。
+#
+# 每个函数接收该字段的原始取值，返回可直接入库的规整结果；
+# 不合法输入抛 PayloadError。“字段未提交”的语义（收录补默认值、
+# 编辑保留旧值）由各入口函数处理，不在字段规则里。
 
-    页面表单转换后的字典与外部 JSON 请求共用这套规则。
-    任何不合法输入都抛 PayloadError，且不会写入数据。
-    """
-    if not isinstance(data, dict):
-        raise PayloadError(None, "请求体必须是 JSON 对象")
 
-    title = data.get("title")
-    if title is None:
-        raise PayloadError("title", "名称为必填项")
+def clean_title_value(title):
+    """名称：必须是字符串，去掉首尾空白后不能为空。"""
     if not isinstance(title, str):
         raise PayloadError("title", "名称必须是字符串")
     title = title.strip()
     if not title:
         raise PayloadError("title", "名称去掉首尾空白后不能为空")
+    return title
 
-    source = data.get("source")
-    if source is None:
-        raise PayloadError("source", "来源为必填项")
+
+def clean_source_value(source, *, empty_message):
+    """来源：必须是字符串，按去掉首尾空白后的文字保存。
+
+    空白来源的提示由调用方给出（收录与编辑的措辞不同）。
+    """
     if not isinstance(source, str):
         raise PayloadError("source", "来源必须是字符串")
     source = source.strip()
     if not source:
-        raise PayloadError("source", "来源去掉首尾空白后不能为空")
+        raise PayloadError("source", empty_message)
+    return source
 
-    raw_duration = data.get("duration")
+
+def clean_duration_value(raw_duration, *, unknown_hint):
+    """时长：None 表示未知；否则必须是有限的非负数字（秒），允许零和
+    小数，布尔值不能当作秒数。类型错误的提示由调用方给出。"""
     if raw_duration is None:
-        duration = None
-    else:
-        if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
-            raise PayloadError("duration", "时长必须是数字（秒），留空表示未知")
-        if not math.isfinite(raw_duration):
-            raise PayloadError("duration", "时长必须是有限的非负数字（秒）")
-        if raw_duration < 0:
-            raise PayloadError("duration", "时长不能为负数（秒）")
-        duration = float(raw_duration)
+        return None
+    if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+        raise PayloadError("duration", f"时长必须是数字（秒），{unknown_hint}")
+    if not math.isfinite(raw_duration):
+        raise PayloadError("duration", "时长必须是有限的非负数字（秒）")
+    if raw_duration < 0:
+        raise PayloadError("duration", "时长不能为负数（秒）")
+    return float(raw_duration)
 
-    cover_url = data.get("cover_url")
+
+def clean_cover_url_value(cover_url):
+    """封面地址：None 视为留空；必须是字符串，去掉首尾空白。"""
     if cover_url is None:
-        cover_url = ""
-    elif not isinstance(cover_url, str):
+        return ""
+    if not isinstance(cover_url, str):
         raise PayloadError("cover_url", "封面地址必须是字符串")
-    else:
-        cover_url = cover_url.strip()
+    return cover_url.strip()
 
-    description = data.get("description")
+
+def clean_description_value(description):
+    """说明：None 视为留空；必须是字符串，保留用户输入原文，
+    包括换行与首尾空白。"""
     if description is None:
-        description = ""
-    elif not isinstance(description, str):
+        return ""
+    if not isinstance(description, str):
         raise PayloadError("description", "说明必须是字符串")
-    # 保留用户输入原文，包括换行与首尾空白。
+    return description
 
-    raw_tags = data.get("tags")
+
+def clean_tags_value(raw_tags):
+    """标签：None 视为空数组；每项必须是字符串，按该项完整文字去掉
+    首尾空白、忽略空项，并按首次出现顺序去重。项内文字（含换行、
+    中英文逗号和顿号）原样保留，绝不拆分成多项。"""
     if raw_tags is None:
         raw_tags = []
     if not isinstance(raw_tags, list):
@@ -125,6 +138,35 @@ def clean_payload(data):
             continue
         seen.add(tag)
         tags.append(tag)
+    return tags
+
+
+def clean_payload(data):
+    """校验并规整一份曲目资料，返回可直接入库的 dict。
+
+    页面表单转换后的字典与外部 JSON 请求共用这套规则：名称与来源
+    必填，选填资料未提交时使用默认值。任何不合法输入都抛
+    PayloadError，且不会写入数据。
+    """
+    if not isinstance(data, dict):
+        raise PayloadError(None, "请求体必须是 JSON 对象")
+
+    title = data.get("title")
+    if title is None:
+        raise PayloadError("title", "名称为必填项")
+    title = clean_title_value(title)
+
+    source = data.get("source")
+    if source is None:
+        raise PayloadError("source", "来源为必填项")
+    source = clean_source_value(source, empty_message="来源去掉首尾空白后不能为空")
+
+    duration = clean_duration_value(
+        data.get("duration"), unknown_hint="留空表示未知"
+    )
+    cover_url = clean_cover_url_value(data.get("cover_url"))
+    description = clean_description_value(data.get("description"))
+    tags = clean_tags_value(data.get("tags"))
 
     force = data.get("save_as_new_version", False)
     if not isinstance(force, bool):
@@ -183,7 +225,8 @@ def find_conflicts(database, source, exclude_id=None):
 def clean_patch_payload(data):
     """校验并规整 PATCH 请求中明确提交的字段，返回只含这些字段的 dict。
 
-    未提交的字段由调用方合并旧值；任何不合法输入都抛 PayloadError，
+    字段规则与收录共用同一实现；未提交的字段由调用方合并旧值，
+    这里不补任何默认值。任何不合法输入都抛 PayloadError，
     且不会写入数据。
     """
     if not isinstance(data, dict):
@@ -192,75 +235,30 @@ def clean_patch_payload(data):
     clean = {}
 
     if "title" in data:
-        title = data["title"]
-        if not isinstance(title, str):
-            raise PayloadError("title", "名称必须是字符串")
-        title = title.strip()
-        if not title:
-            raise PayloadError("title", "名称去掉首尾空白后不能为空")
-        clean["title"] = title
+        clean["title"] = clean_title_value(data["title"])
 
     if "source" in data:
         source = data["source"]
+        # 已有来源不能清空：明确提交 null 或空白来源都拒绝。
         if source is None:
             raise PayloadError("source", "来源不能清空；如不再收录该来源，请取消编辑")
-        if not isinstance(source, str):
-            raise PayloadError("source", "来源必须是字符串")
-        source = source.strip()
-        if not source:
-            raise PayloadError("source", "来源不能清空；如不再收录该来源，请取消编辑")
-        clean["source"] = source
+        clean["source"] = clean_source_value(
+            source, empty_message="来源不能清空；如不再收录该来源，请取消编辑"
+        )
 
     if "duration" in data:
-        raw_duration = data["duration"]
-        if raw_duration is None:
-            duration = None
-        else:
-            if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
-                raise PayloadError("duration", "时长必须是数字（秒），设为 null 表示未知")
-            if not math.isfinite(raw_duration):
-                raise PayloadError("duration", "时长必须是有限的非负数字（秒）")
-            if raw_duration < 0:
-                raise PayloadError("duration", "时长不能为负数（秒）")
-            duration = float(raw_duration)
-        clean["duration"] = duration
+        clean["duration"] = clean_duration_value(
+            data["duration"], unknown_hint="设为 null 表示未知"
+        )
 
     if "cover_url" in data:
-        cover_url = data["cover_url"]
-        if cover_url is None:
-            cover_url = ""
-        elif not isinstance(cover_url, str):
-            raise PayloadError("cover_url", "封面地址必须是字符串")
-        else:
-            cover_url = cover_url.strip()
-        clean["cover_url"] = cover_url
+        clean["cover_url"] = clean_cover_url_value(data["cover_url"])
 
     if "description" in data:
-        description = data["description"]
-        if description is None:
-            description = ""
-        elif not isinstance(description, str):
-            raise PayloadError("description", "说明必须是字符串")
-        # 保留用户输入原文，包括换行与首尾空白。
-        clean["description"] = description
+        clean["description"] = clean_description_value(data["description"])
 
     if "tags" in data:
-        raw_tags = data["tags"]
-        if raw_tags is None:
-            raw_tags = []
-        if not isinstance(raw_tags, list):
-            raise PayloadError("tags", "标签必须是字符串数组")
-        tags = []
-        seen = set()
-        for item in raw_tags:
-            if not isinstance(item, str):
-                raise PayloadError("tags", "标签中的每一项都必须是字符串")
-            tag = item.strip()
-            if not tag or tag in seen:
-                continue
-            seen.add(tag)
-            tags.append(tag)
-        clean["tags"] = tags
+        clean["tags"] = clean_tags_value(data["tags"])
 
     return clean
 
