@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
-"""曲目编辑接口（PATCH /api/tracks/{id}）与编辑页标签保存的回归测试。
+"""曲目收录（POST /api/tracks）与首页手动收录表单、编辑接口的回归测试。
 
 通过子进程真实启动 SoundShelf 服务，用 HTTP 请求固定以下既有规则：
 
+收录时的重复来源保障：
+- 已有曲目使用某来源时，再提交去掉首尾空白后相同的来源（即使名称、说明等
+  其他资料全部不同），未选择另存或显式传 false 都返回 409；existing 按 id
+  升序列出该来源的全部已有记录（只有 id 和 title），不混入其他来源，
+  拒绝时不新增记录也不改动任一已有记录。
+- 仅当 save_as_new_version 为布尔值 true（或首页勾选“另存为新版本”）时
+  才新增独立标识的记录：接口返回 201 和本次保存的完整曲目，首页 303 后
+  列表显示新曲目与成功提示；原各版本不被覆盖或合并，列表仍按标识顺序同时
+  展示。该字段传入字符串或数字一律 400 并指出字段，不能当作同意另存。
+- 同名但来源不同直接收录成功；来源文字只有首尾空白被忽略，内部差异
+  （含内部空白）不合并；只有标识与名称、来源缺失的旧记录不参加判重。
+
+编辑（PATCH /api/tracks/{id}）与编辑页标签保存：
 - 同一来源允许另存多个独立版本；编辑其中一条时，它自己不构成冲突，
   来源未改变（含仅首尾空白不同）时不拒绝其他资料的保存。
 - 把来源改成其他曲目已使用的文字时返回 409，existing 按 id 升序列出
@@ -47,6 +60,23 @@ DESCRIPTION_RE = re.compile(
 BANNER_ERROR_RE = re.compile(
     r'<p class="banner error" role="alert">(.*?)</p>', re.DOTALL
 )
+BANNER_SUCCESS_RE = re.compile(
+    r'<p class="banner success">(.*?)</p>', re.DOTALL
+)
+CONFLICT_LIST_RE = re.compile(
+    r'<ul class="conflict-list">(.*?)</ul>', re.DOTALL
+)
+CONFLICT_ITEM_RE = re.compile(
+    r'<li><span class="track-id">#(\d+)</span> (.*?)</li>', re.DOTALL
+)
+TRACK_LIST_ITEM_RE = re.compile(
+    r'<li id="track-(\d+)"[^>]*>.*?<p class="track-title">'
+    r'<span class="track-id">#\d+</span>(.*?)</p>',
+    re.DOTALL,
+)
+FORCE_CHECKBOX_RE = re.compile(
+    r'<input type="checkbox" id="f-force"[^>]*?>'
+)
 FIELD_ERROR_RE = re.compile(r'<p class="field-error">(.*?)</p>', re.DOTALL)
 
 
@@ -64,6 +94,34 @@ def parse_input_value(page, field_id, name):
     match = re.search(pattern, page, re.DOTALL)
     assert match is not None, f"页面中找不到字段 {name} 的输入框"
     return html.unescape(match.group(1))
+
+
+def parse_conflicts(page):
+    """提取首页/编辑页冲突横幅中的记录，返回 [(id, title), ...]（按展示顺序）。"""
+    box = CONFLICT_LIST_RE.search(page)
+    if box is None:
+        return None
+    return [
+        (int(match.group(1)), html.unescape(match.group(2)))
+        for match in CONFLICT_ITEM_RE.finditer(box.group(1))
+    ]
+
+
+def parse_listing_ids(page):
+    """提取首页曲目列表中各曲目的 (id, title)，按页面展示顺序。"""
+    return [
+        (int(match.group(1)), html.unescape(match.group(2)))
+        for match in TRACK_LIST_ITEM_RE.finditer(page)
+    ]
+
+
+def force_checkbox_present(page):
+    return FORCE_CHECKBOX_RE.search(page) is not None
+
+
+def force_checkbox_checked(page):
+    match = FORCE_CHECKBOX_RE.search(page)
+    return match is not None and "checked" in match.group(0)
 
 
 def duration_text(value):
@@ -272,13 +330,462 @@ class ServerTestCase(unittest.TestCase):
             )
         if cover_url is not None:
             self.assertEqual(
-                parse_input_value(page, "cover_url", "cover_url"), cover_url
+                parse_input_value(page, "cover-url", "cover_url"), cover_url
             )
         if description is not None:
             match = DESCRIPTION_RE.search(page)
             self.assertIsNotNone(match)
             self.assertEqual(html.unescape(match.group(1)), description)
 
+    # -- 收录接口（POST /api/tracks）与首页收录表单 ---------------------------
+
+    def post_json(self, payload):
+        return self.server.request("POST", "/api/tracks", payload)
+
+    def get_home(self, path="/"):
+        status, headers, page = self.server.get_page(path)
+        self.assertEqual(status, 200, page[:500])
+        return page
+
+    def home_form_fields(self, *, title="", source="", duration="",
+                         cover_url="", description="", tags="", force=False):
+        """构造一份首页收录表单字段（收录页的标签是逗号分隔的单个输入框）。"""
+        fields = [
+            ("title", title),
+            ("source", source),
+            ("duration", duration),
+            ("cover_url", cover_url),
+            ("description", description),
+            ("tags", tags),
+        ]
+        if force:
+            # 勾选框勾选时浏览器才会提交该字段，值为表单里的 value="1"。
+            fields.append(("save_as_new_version", "1"))
+        return fields
+
+    def post_home(self, fields, *, follow_redirects=False):
+        return self.server.post_form(
+            "/", fields, follow_redirects=follow_redirects
+        )
+
+    def assert_home_form_retains(self, page, *, title=None, source=None,
+                                 duration=None, cover_url=None,
+                                 description=None, tags=None):
+        """断言首页收录表单各字段回填的是本次提交时填写的原始内容。"""
+        if title is not None:
+            self.assertEqual(parse_input_value(page, "title", "title"), title)
+        if source is not None:
+            self.assertEqual(parse_input_value(page, "source", "source"), source)
+        if duration is not None:
+            self.assertEqual(
+                parse_input_value(page, "duration", "duration"), duration
+            )
+        if cover_url is not None:
+            self.assertEqual(
+                parse_input_value(page, "cover-url", "cover_url"), cover_url
+            )
+        if description is not None:
+            match = DESCRIPTION_RE.search(page)
+            self.assertIsNotNone(match)
+            # 浏览器按 CRLF 提交，失败重绘时允许保留这个换行形态。
+            self.assertEqual(
+                html.unescape(match.group(1)).replace("\r\n", "\n"),
+                description.replace("\r\n", "\n"),
+            )
+        if tags is not None:
+            self.assertEqual(parse_input_value(page, "tags", "tags"), tags)
+
+
+class IntakeDuplicateSourceRejectTest(ServerTestCase):
+    """收录时来源已被使用：默认或显式不另存都返回 409，列全冲突且不写库。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            cover_url="https://img.example/yehang-remaster.png",
+            description="重制说明",
+            tags=["民谣", "重制"],
+            save_as_new_version=True,
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=9
+        )
+
+    def retry_payload(self, **overrides):
+        """一份与已有记录名称、说明等资料全部不同的重复来源提交。"""
+        payload = {
+            "title": "夜航·现场录音（全新名称）",
+            "source": "/music/yehang.flac",
+            "duration": 260,
+            "cover_url": "https://img.example/live.png",
+            "description": "完全不同的现场版说明",
+            "tags": ["现场", "新标签"],
+        }
+        payload.update(overrides)
+        return payload
+
+    def assert_rejected_with_both_occupants(self, payload):
+        status, body = self.post_json(payload)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["field"], "source")
+        # existing 列出该来源的全部已有记录，按标识升序，
+        # 每项只有 id 与名称，且不混入其他来源的曲目。
+        self.assertEqual(body["existing"], [
+            {"id": self.first["id"], "title": "夜航·首版"},
+            {"id": self.second["id"], "title": "夜航·重制"},
+        ])
+        for item in body["existing"]:
+            self.assertEqual(set(item.keys()), {"id", "title"})
+        return body
+
+    def test_duplicate_source_without_flag_is_rejected(self):
+        # 即使名称、时长、封面、说明、标签全部不同，来源相同也默认拒绝。
+        self.assert_rejected_with_both_occupants(self.retry_payload())
+
+    def test_explicit_false_is_also_rejected(self):
+        self.assert_rejected_with_both_occupants(
+            self.retry_payload(save_as_new_version=False)
+        )
+
+    def test_duplicate_source_differs_only_by_surrounding_whitespace(self):
+        # 只有来源首尾空白被忽略：裁剪后相同即判为重复。
+        self.assert_rejected_with_both_occupants(
+            self.retry_payload(source=" \t/music/yehang.flac\n  ")
+        )
+
+    def test_rejection_creates_nothing_and_changes_nothing(self):
+        before = self.list_tracks()
+        status, _ = self.post_json(self.retry_payload())
+        self.assertEqual(status, 409)
+        # 再来一次显式不另存，同样不能有任何写入。
+        status, _ = self.post_json(
+            self.retry_payload(save_as_new_version=False)
+        )
+        self.assertEqual(status, 409)
+
+        after = self.list_tracks()
+        # 记录数量与标识顺序不变，各已有记录整条资料原样保留。
+        self.assertEqual(after, before)
+        self.assertEqual(
+            [t["id"] for t in after],
+            [self.first["id"], self.second["id"], self.bystander["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+
+class IntakeSaveAsNewVersionTest(ServerTestCase):
+    """明确另存：得到独立新记录；同名不同来源直接成功；另存选项严格收布尔。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+
+    def test_true_creates_independent_record_with_submitted_data(self):
+        payload = {
+            "title": "夜航·现场版",
+            "source": "/music/yehang.flac",
+            "duration": 260,
+            "cover_url": "https://img.example/live.png",
+            "description": "现场版说明\n保留换行",
+            "tags": ["现场", "新标签", "现场"],  # 收录时按规则去重
+        }
+        status, body = self.post_json(
+            {**payload, "save_as_new_version": True}
+        )
+        self.assertEqual(status, 201, body)
+        self.assertIsInstance(body["id"], int)
+        self.assertNotEqual(body["id"], self.first["id"])
+        # 返回本次保存的完整曲目，保存的是本次提交（含校验规整）后的资料。
+        self.assertEqual(body, {
+            "id": body["id"],
+            "title": "夜航·现场版",
+            "source": "/music/yehang.flac",
+            "duration": 260,
+            "cover_url": "https://img.example/live.png",
+            "description": "现场版说明\n保留换行",
+            "tags": ["现场", "新标签"],
+        })
+
+        tracks = self.list_tracks()
+        # 列表同时能看到两个版本，按原有标识顺序展示。
+        self.assertEqual([t["id"] for t in tracks],
+                         [self.first["id"], body["id"]])
+        # 原版本不被覆盖或合并。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(body["id"]), body)
+
+    def test_repeated_true_keeps_every_version_separate_and_id_ordered(self):
+        second = self.post_json({
+            "title": "夜航·重制",
+            "source": "/music/yehang.flac",
+            "duration": 250,
+            "save_as_new_version": True,
+        })
+        self.assertEqual(second[0], 201)
+        third_status, third = self.post_json({
+            "title": "夜航·再版",
+            "source": "/music/yehang.flac",
+            "duration": 255,
+            "save_as_new_version": True,
+        })
+        self.assertEqual(third_status, 201, third)
+        self.assertNotEqual(second[1]["id"], third["id"])
+
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.first["id"], second[1]["id"], third["id"]],
+        )
+        self.assertEqual(
+            [t["title"] for t in tracks],
+            ["夜航·首版", "夜航·重制", "夜航·再版"],
+        )
+        # 三个版本各自保存自己的资料。
+        self.assertEqual(
+            self.track_by_id(second[1]["id"])["duration"], 250
+        )
+        self.assertEqual(
+            self.track_by_id(third["id"])["duration"], 255
+        )
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+    def test_same_title_different_source_succeeds_directly(self):
+        # 同名不判重：普通收录（不带另存选项）直接成功。
+        status, body = self.post_json({
+            "title": "夜航·首版",
+            "source": "/music/yehang-cover.flac",
+        })
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["source"], "/music/yehang-cover.flac")
+        self.assertEqual(len(self.list_tracks()), 2)
+
+    def test_internal_source_text_differences_are_not_merged(self):
+        # 首尾空白之外的文字差异（查询串、内部空格等）都是不同来源，
+        # 不能被额外合并，普通收录直接成功。
+        for source in (
+            "/music/yehang.flac?bitrate=320",
+            "/music/yehang live.flac",
+            "/music/YEHANG.flac",
+        ):
+            status, body = self.post_json(
+                {"title": "另一写法", "source": source}
+            )
+            self.assertEqual(status, 201, (source, body))
+            self.assertEqual(body["source"], source)
+        self.assertEqual(len(self.list_tracks()), 4)
+
+    def test_non_boolean_save_flag_is_400_and_never_writes(self):
+        # 字符串（包括看起来像 true/false 的）与数字都不能当作同意另存。
+        for bad_value in ("true", "false", "1", "0", 1, 0):
+            with self.subTest(bad_value=bad_value):
+                status, body = self.post_json({
+                    "title": "不应写入的版本",
+                    "source": "/music/yehang.flac",
+                    "save_as_new_version": bad_value,
+                })
+                self.assertEqual(status, 400, (bad_value, body))
+                # 错误必须明确指出该字段。
+                self.assertEqual(body["field"], "save_as_new_version")
+                self.assertIn("save_as_new_version", body["error"])
+
+        # 所有非法尝试后仍只有最初的一条记录，没有任何新曲目写入。
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0], self.first)
+
+
+class LegacyTrackIntakeTest(ServerTestCase):
+    """只有标识与名称、来源缺失的旧记录不参加收录判重。"""
+
+    def setUp(self):
+        super().setUp()
+        self.legacy_a = self.server.insert_legacy("同名曲目")
+        self.legacy_b = self.server.insert_legacy("同名曲目")
+
+    def test_legacy_name_alone_does_not_block_intake(self):
+        # 旧记录名称相同不拦住新收录；两条同名旧记录也互不判重。
+        status, body = self.post_json({
+            "title": "同名曲目",
+            "source": "/music/new.flac",
+        })
+        self.assertEqual(status, 201, body)
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.legacy_a, self.legacy_b, body["id"]],
+        )
+        self.assertIsNone(self.track_by_id(self.legacy_a)["source"])
+
+    def test_legacy_records_never_listed_as_source_conflicts(self):
+        normal = self.create_track(title="正常曲目", source="/music/taken.flac")
+        status, body = self.post_json({
+            "title": "另一条同名曲目",
+            "source": " /music/taken.flac ",
+        })
+        self.assertEqual(status, 409, body)
+        # existing 只包含真正使用该来源的记录，旧记录即使同名也不混入。
+        self.assertEqual(body["existing"], [
+            {"id": normal["id"], "title": "正常曲目"},
+        ])
+        self.assertEqual(len(self.list_tracks()), 3)
+
+
+class HomeIntakeDuplicateTest(ServerTestCase):
+    """首页手动收录表单：重复来源拒绝并展示冲突、回填资料；勾选后另存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243,
+            description="首版说明",
+            tags=["民谣"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            description="重制说明",
+            tags=["重制"],
+            save_as_new_version=True,
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac"
+        )
+
+    def test_duplicate_without_checkbox_shows_conflicts_and_keeps_input(self):
+        fields = self.home_form_fields(
+            title="夜航·现场录音（全新名称）",
+            source=" \t/music/yehang.flac\n ",
+            duration="260",
+            cover_url="https://img.example/live.png",
+            description="现场版说明\n第二行",
+            tags="现场, 新标签",
+        )
+        status, headers, page = self.post_home(fields)
+        self.assertEqual(status, 409, page[:500])
+
+        # 页面列出该来源全部已有记录（按标识升序），不含其他来源曲目。
+        self.assertEqual(parse_conflicts(page), [
+            (self.first["id"], "夜航·首版"),
+            (self.second["id"], "夜航·重制"),
+        ])
+        # 错误横幅提示需要明确选择另存。
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner)
+        self.assertIn("另存", strip_tags(banner.group(1)))
+
+        # 本次填写的资料全部保留，包括来源首尾空白、说明换行与标签原文，
+        # 勾选框保持未勾选，便于用户辨认后决定是否另存。
+        self.assert_home_form_retains(
+            page,
+            title="夜航·现场录音（全新名称）",
+            source=" \t/music/yehang.flac\n ",
+            duration="260",
+            cover_url="https://img.example/live.png",
+            description="现场版说明\n第二行",
+            tags="现场, 新标签",
+        )
+        self.assertTrue(force_checkbox_present(page))
+        self.assertFalse(force_checkbox_checked(page))
+
+        # 列表里不能出现这次未保存的曲目，仍是原来三条且顺序不变。
+        self.assertEqual(parse_listing_ids(page), [
+            (self.first["id"], "夜航·首版"),
+            (self.second["id"], "夜航·重制"),
+            (self.bystander["id"], "无关曲目"),
+        ])
+
+    def test_conflict_adds_nothing_and_changes_nothing(self):
+        before = self.list_tracks()
+        status, _, _ = self.post_home(self.home_form_fields(
+            title="不应保存", source="/music/yehang.flac",
+        ))
+        self.assertEqual(status, 409)
+        after = self.list_tracks()
+        self.assertEqual(after, before)
+        self.assertEqual(
+            [t["id"] for t in after],
+            [self.first["id"], self.second["id"], self.bystander["id"]],
+        )
+
+    def test_checking_save_as_new_version_creates_and_shows_record(self):
+        fields = self.home_form_fields(
+            title="夜航·现场版",
+            source="/music/yehang.flac",
+            duration="260",
+            description="首页表单另存的版本",
+            tags="现场, 新标签, 现场",
+            force=True,
+        )
+        status, headers, page = self.post_home(fields)
+        self.assertEqual(status, 303, page[:500])
+
+        match = re.fullmatch(r"/\?highlight=(\d+)", headers["Location"])
+        self.assertIsNotNone(match, headers["Location"])
+        new_id = int(match.group(1))
+        self.assertNotIn(new_id, (self.first["id"], self.second["id"]))
+
+        # 跟随重定向回到列表：成功提示指向新曲目，列表按标识顺序同时展示。
+        home = self.get_home(headers["Location"])
+        success = BANNER_SUCCESS_RE.search(home)
+        self.assertIsNotNone(success)
+        notice = strip_tags(success.group(1))
+        self.assertIn("收录成功", notice)
+        self.assertIn(f"#{new_id}", notice)
+        self.assertEqual(parse_listing_ids(home), [
+            (self.first["id"], "夜航·首版"),
+            (self.second["id"], "夜航·重制"),
+            (self.bystander["id"], "无关曲目"),
+            (new_id, "夜航·现场版"),
+        ])
+
+        # 新记录保存的是本次提交的资料；原有各版本不被覆盖或合并。
+        self.assertEqual(self.track_by_id(new_id), {
+            "id": new_id,
+            "title": "夜航·现场版",
+            "source": "/music/yehang.flac",
+            "duration": 260,
+            "cover_url": "",
+            "description": "首页表单另存的版本",
+            "tags": ["现场", "新标签"],
+        })
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+    def test_same_title_different_source_succeeds_from_home(self):
+        status, headers, page = self.post_home(self.home_form_fields(
+            title="夜航·首版",
+            source="/music/yet-another.flac",
+            duration="12",
+        ))
+        self.assertEqual(status, 303, page[:500])
+        new_id = int(re.fullmatch(r"/\?highlight=(\d+)", headers["Location"]).group(1))
+        self.assertEqual(len(self.list_tracks()), 4)
+        self.assertEqual(
+            self.track_by_id(new_id)["source"], "/music/yet-another.flac"
+        )
 
 
 class SameSourceVersionsEditTest(ServerTestCase):
