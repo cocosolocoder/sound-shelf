@@ -418,6 +418,12 @@ def render_track_form(form, error, error_field, *, action, submit_label,
     if edit_mode:
         cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
 
+    # 来源按文字保存，内部换行与空格都是来源的一部分：用多行输入框完整
+    # 呈现已保存来源（含开头空行，由 textarea_content 抵消 HTML 解析
+    # 吞掉的第一个换行），框高随实际行数自适应。
+    source_text = form.get("source", "")
+    source_rows = min(max(1, source_text.count("\n") + 1), 10)
+
     if edit_mode:
         # 编辑页每个标签项一个独立输入框：标签文字内部的换行保留在
         # 该项自己的输入框中，不会再把一个标签拆成几个；标签内的逗号、
@@ -471,8 +477,8 @@ def render_track_form(form, error, error_field, *, action, submit_label,
   <label for="f-title">名称 <span class="hint">（必填）</span></label>
   <input type="text" id="f-title" name="title" value="{value("title")}">
   {inline_error("title")}
-  <label for="f-source">来源 <span class="hint">（必填，网址或本地文件路径，按文字原样保存，不检查能否播放）</span></label>
-  <input type="text" id="f-source" name="source" value="{value("source")}">
+  <label for="f-source">来源 <span class="hint">（必填，网址或本地文件路径，按文字原样保存，内部换行与空格都会保留，不检查能否播放）</span></label>
+  <textarea id="f-source" name="source" class="source-box" rows="{source_rows}">{textarea_content(source_text)}</textarea>
   {inline_error("source")}
   <label for="f-duration">时长 <span class="hint">（秒，可留空表示未知；允许 0 和小数）</span></label>
   <input type="text" id="f-duration" name="duration" inputmode="decimal" value="{value("duration")}">
@@ -591,6 +597,7 @@ form.track-form label{{display:block;font-weight:600;margin-top:.8rem}}
 form.track-form .hint{{font-weight:400;color:#627d98;font-size:.9em}}
 form.track-form input[type=text],form.track-form textarea{{width:100%;box-sizing:border-box;padding:.45rem .6rem;border:1px solid #bcccdc;border-radius:4px;font:inherit}}
 form.track-form textarea{{min-height:5.5rem;resize:vertical}}
+form.track-form textarea.source-box{{min-height:2.4rem}}
 .field-error{{color:#b3261e;margin:.25rem 0 0;font-size:.92em}}
 form.track-form button{{margin-top:1.1rem;padding:.5rem 1.2rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#1769aa;color:#fff;cursor:pointer}}
 .form-cancel{{margin:.6rem 0 0;font-size:.95em}}
@@ -775,7 +782,10 @@ def form_to_payload(form, *, edit_mode=False):
 
     payload = {
         "title": one("title"),
-        "source": one("source"),
+        # 来源框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
+        # LF，使网页填写的来源与接口按文字收录的同一段来源一致；编辑时
+        # 调用方再据此判断用户是否真的改过来源。
+        "source": normalize_newlines(one("source")),
         "duration": duration,
         "cover_url": one("cover_url"),
         "description": description,
@@ -935,8 +945,10 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
-            # 失败重绘时按 LF 回填说明框（浏览器以 CRLF 提交换行），
-            # 连同开头空行、段落空行、结尾空行与首尾空格一起保留。
+            # 失败重绘时按 LF 回填来源框与说明框（浏览器以 CRLF 提交换行），
+            # 来源的内部换行与空格、说明的开头空行、段落空行、结尾空行与
+            # 首尾空格都按本次填写完整保留。
+            form_view["source"] = normalize_newlines(form_view["source"])
             form_view["description"] = normalize_newlines(
                 form_view["description"]
             )
@@ -968,9 +980,19 @@ def main():
                     record["description"]
                 ):
                     del payload["description"]
+                # 用户没有改动来源时（提交文字去掉首尾空白、换行归一化后
+                # 与原来源一致），不提交该字段：原来源逐字节保留，原文使用
+                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
+                # 被改写，仅内部换行写法不同的两段来源也不会因此变成同一
+                # 段；确实修改来源内部的文字、空格或分行时才按本次填写
+                # （换行统一为 LF）去掉首尾空白保存并参与判重。
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
                 # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
-                if record["source"] is None and not payload["source"].strip():
+                if record["source"] is None:
+                    if not payload["source"].strip():
+                        del payload["source"]
+                elif (payload["source"].strip()
+                      == normalize_newlines(record["source"]).strip()):
                     del payload["source"]
                 updated, conflicts = update_track(database, track_id, payload)
             except PayloadError as exc:
