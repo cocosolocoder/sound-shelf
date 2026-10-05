@@ -33,6 +33,21 @@
   资料的曲目，失败前填写的选填内容不能丢掉。错误提交前已有的曲目保留
   完整资料和列表顺序，记录数量不增加；空曲库中的失败提交也仍显示没有
   记录。
+- 首页手动收录表单的时长填写方式决定保存结果：非负整数与有限的非负
+  小数文字（首尾空白忽略）保存成功后 303 回首页，提示收录成功，列表
+  中新增一条采用本次完整资料的曲目；时长按填写的秒数保存和展示
+  （“243.5 秒”，不换算分钟，不把小数截成整数），随后曲目列表接口
+  读到的时长与网页一致。填写“0”显示“0 秒”且仍是数字零；时长框留空
+  或只填空白则保存为未知，列表显示“未知”，接口为 null。负数、普通
+  文字、NaN、Infinity 或“1e999”等超出有限数值范围的文字返回 400，
+  页面提示保存失败并在时长字段附近说明时长有误；时长框保留本次填写的
+  原文，名称、来源、封面地址、说明、标签与另存为新版本的选择也全部
+  回填，说明中的中文、换行与形似网页标签的文字仍按普通文字转义显示。
+  时长错误时即使其余资料都合法也不新增任何曲目或保存部分资料：空曲库
+  仍显示没有记录，已有曲目的完整资料、数量与列表顺序保持原样。用户在
+  错误页只修正时长、保留其余填写后再次保存，只新增一条采用回填资料与
+  修正后时长的曲目，失败提交不留下额外记录；来源重复与另存为新版本的
+  既有规则在时长出错与修正流程中同样有效。
 
 编辑（PATCH /api/tracks/{id} 与 /tracks/{id}/edit 表单）：
 - 同一来源允许另存多个独立版本；编辑其中一条时，它自己不构成冲突，
@@ -3863,6 +3878,515 @@ class HomeCreateRequiredFieldWithExistingTest(ServerTestCase):
         self.assertEqual(record["cover_url"], "")
         self.assertEqual(record["description"], "")
         self.assertEqual(record["tags"], [])
+
+
+class HomeCreateDurationValidSaveTest(ServerTestCase):
+    """首页收录表单：时长填写方式决定这次保存的结果（合法路径）。
+
+    名称、来源等其余资料合法且来源尚未收录时，非负整数与有限的非负
+    小数文字保存成功：303 回首页、提示收录成功，列表新增一条采用本次
+    完整资料的曲目，时长按填写的秒数保存和展示；“0”与未知严格区分。
+    """
+
+    def submit_and_open_listing(self, fields):
+        status, headers, _ = self.post_create_form(fields)
+        self.assertEqual(status, 303, "保存应成功并 303 回首页")
+        match = re.search(r"highlight=(\d+)$", headers["Location"])
+        self.assertIsNotNone(match, headers["Location"])
+        new_id = int(match.group(1))
+        status, _, listing_page = self.server.get_page(headers["Location"])
+        self.assertEqual(status, 200, listing_page[:500])
+        return new_id, listing_page
+
+    def test_decimal_seconds_saved_and_shown_without_conversion(self):
+        # 有限非负小数：不换算成分钟，不把小数截成整数。
+        fields = self.create_form_fields(
+            title="夜航·现场",
+            source="/音乐/yehang-live.flac",
+            duration="243.5",
+            cover_url="https://img.example/yehang.png",
+            description="现场录音\n第二行中文",
+            tags="民谣,现场,民谣",
+        )
+        new_id, listing_page = self.submit_and_open_listing(fields)
+
+        # 首页提示收录成功，并指出新曲目标识。
+        success = strip_tags(BANNER_SUCCESS_RE.search(listing_page).group(1))
+        self.assertIn("收录成功", success)
+        self.assertIn(f"#{new_id}", success)
+        # 列表显示新曲目，时长按填写的秒数展示为“243.5 秒”。
+        self.assertEqual(parse_listed_tracks(listing_page),
+                         [(new_id, "夜航·现场")])
+        self.assertEqual(parse_listed_durations(listing_page), ["243.5 秒"])
+
+        # 只新增一条采用本次完整资料的曲目：标签裁剪去重，其余原样。
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        record = tracks[0]
+        self.assertEqual(record, {
+            "id": new_id,
+            "title": "夜航·现场",
+            "source": "/音乐/yehang-live.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/yehang.png",
+            "description": "现场录音\n第二行中文",
+            "tags": ["民谣", "现场"],
+        })
+        # 随后从曲目列表接口读到的时长与网页显示一致（不截断小数）。
+        self.assertIsInstance(record["duration"], float)
+        self.assertEqual(self.track_by_id(new_id)["duration"], 243.5)
+
+    def test_integer_seconds_kept_as_integer_seconds(self):
+        fields = self.create_form_fields(
+            title="整数秒曲目", source="/music/seconds.flac", duration="307",
+        )
+        new_id, listing_page = self.submit_and_open_listing(fields)
+        self.assertEqual(parse_listed_tracks(listing_page),
+                         [(new_id, "整数秒曲目")])
+        self.assertEqual(parse_listed_durations(listing_page), ["307 秒"])
+        record = self.track_by_id(new_id)
+        self.assertEqual(record["duration"], 307)
+        self.assertIsInstance(record["duration"], int)
+
+    def test_zero_is_zero_seconds_not_unknown(self):
+        # 特别保留零与未知的区别：填写“0”后显示“0 秒”，零仍是数字零。
+        fields = self.create_form_fields(
+            title="零秒曲目", source="/music/zero.flac", duration="0",
+        )
+        new_id, listing_page = self.submit_and_open_listing(fields)
+        self.assertEqual(parse_listed_durations(listing_page), ["0 秒"])
+        record = self.track_by_id(new_id)
+        self.assertEqual(record["duration"], 0)
+        self.assertIsNotNone(record["duration"])
+        self.assertIsInstance(record["duration"], int)
+
+    def test_empty_and_whitespace_box_save_as_unknown(self):
+        # 时长框留空或只填空白则保存为未知：列表显示“未知”，接口为 null。
+        for typed in ("", " ", "\t", "  \t "):
+            with self.subTest(typed=repr(typed)):
+                title = f"未知时长曲目 {typed!r}"
+                new_id, listing_page = self.submit_and_open_listing(
+                    self.create_form_fields(
+                        title=title,
+                        source=f"/music/unknown-{len(self.list_tracks())}.flac",
+                        duration=typed,
+                    )
+                )
+                self.assertEqual(parse_listed_durations(listing_page)[-1:],
+                                 ["未知"])
+                record = self.track_by_id(new_id)
+                self.assertIsNone(record["duration"])
+
+    def test_surrounding_whitespace_does_not_change_number(self):
+        # 数字前后的空白不影响数值；保存与展示都是去掉空白后的秒数。
+        fields = self.create_form_fields(
+            title="带空白的数字", source="/music/spaced.flac",
+            duration=" \t 243.5 \n",
+        )
+        new_id, listing_page = self.submit_and_open_listing(fields)
+        self.assertEqual(parse_listed_durations(listing_page), ["243.5 秒"])
+        self.assertEqual(self.track_by_id(new_id)["duration"], 243.5)
+
+    def test_extra_decimal_forms_accepted(self):
+        # .5 / +12 / 0.0 都是有限非负数字文字，按对应数值保存。
+        for typed, expected in ((".5", 0.5), ("+12", 12.0), ("0.0", 0)):
+            with self.subTest(typed=typed):
+                new_id, _ = self.submit_and_open_listing(
+                    self.create_form_fields(
+                        title=f"形式 {typed}",
+                        source=f"/music/form-{len(self.list_tracks())}.flac",
+                        duration=typed,
+                    )
+                )
+                self.assertEqual(
+                    self.track_by_id(new_id)["duration"], expected
+                )
+
+
+class HomeCreateDurationInvalidTest(ServerTestCase):
+    """首页收录表单：时长无法解析为有限非负数时 400，原样回填且不写入。"""
+
+    def assert_duration_error_shown(self, page, typed):
+        # 页面显示保存失败。
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner, "页面应显示保存失败提示")
+        self.assertIn("保存失败", strip_tags(banner.group(1)))
+        self.assertIn("时长", strip_tags(banner.group(1)))
+        # 时长字段附近明确说明时长有误。
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(
+            any("时长" in text for text in field_errors),
+            f"时长字段附近应显示错误，实际：{field_errors}",
+        )
+        # 时长框必须保留本次填写的原文，不能改成空白、零或其他值。
+        self.assert_form_values(page, duration=typed)
+
+    def full_fields(self, duration, *, save_as_new_version=False):
+        return self.create_form_fields(
+            title="夜航·候选",
+            source="/音乐/候选/录音.flac",
+            duration=duration,
+            cover_url="https://img.example/candidate.png",
+            description="候选说明：中文\n第二行 <b>看起来像标签</b>\n结尾",
+            tags="民谣,现场，新编、自留",
+            save_as_new_version=save_as_new_version,
+        )
+
+    def test_bad_texts_return_400_and_keep_typed_text(self):
+        for typed in ("-1", "-0.5", "-243.5", "abc", "时长",
+                      "NaN", "Infinity", "-Infinity", "1e999",
+                      "1e1000", "0x10", "1.2.3"):
+            with self.subTest(typed=typed):
+                status, _, page = self.post_create_form(
+                    self.full_fields(typed)
+                )
+                self.assertEqual(status, 400, page[:500])
+                self.assert_duration_error_shown(page, typed)
+
+    def test_failed_submission_reprints_every_filled_field(self):
+        # 时长错误时，名称、来源、封面地址、说明、标签与另存选择也保留
+        # 本次填写；勾选另存为新版本时回填页仍保持勾选。
+        fields = self.full_fields("abc", save_as_new_version=True)
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assert_duration_error_shown(page, "abc")
+        self.assert_form_values(
+            page,
+            title="夜航·候选",
+            source="/音乐/候选/录音.flac",
+            duration="abc",
+            cover_url="https://img.example/candidate.png",
+            description="候选说明：中文\n第二行 <b>看起来像标签</b>\n结尾",
+        )
+        self.assertEqual(
+            parse_input_value(page, "tags", "tags"),
+            "民谣,现场，新编、自留",
+        )
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        self.assertIsNotNone(checkbox)
+        self.assertIn("checked", checkbox.group(0))
+
+    def test_unchecked_save_as_new_version_stays_unchecked(self):
+        # 未勾选另存时，时长失败的回填页不得偷偷选中勾选框。
+        fields = self.full_fields("-5", save_as_new_version=False)
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assert_duration_error_shown(page, "-5")
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        self.assertIsNotNone(checkbox)
+        self.assertNotIn("checked", checkbox.group(0))
+
+    def test_description_chinese_newlines_tags_shown_as_plain_text(self):
+        # 说明中的中文、换行与看起来像网页标签的文字仍按普通文字显示，
+        # 不能在失败回填时丢掉或变成页面内容。
+        description = (
+            "中文“引号”\n<尖括号> 与 <b>看起来像标签</b>\n"
+            "</textarea><script>alert(1)</script>"
+        )
+        fields = self.create_form_fields(
+            title="夜航·候选",
+            source="/music/candidate.flac",
+            duration="1e999",
+            description=description,
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(parse_description_box(page), description)
+        markup = description_box_markup(page)
+        self.assertNotIn("<script>", markup)
+        self.assertNotIn("<b>", markup)
+        self.assertIn("&lt;b&gt;", markup)
+        self.assertIn("&lt;/textarea&gt;", markup)
+
+
+class HomeCreateDurationInvalidEmptyLibraryTest(ServerTestCase):
+    """空曲库时首页时长失败：400 回填，不新增任何记录或保存部分资料。"""
+
+    def test_invalid_duration_creates_nothing_in_empty_library(self):
+        for typed in ("-1", "abc", "NaN", "Infinity", "1e999"):
+            with self.subTest(typed=typed):
+                status, _, page = self.post_create_form(
+                    self.create_form_fields(
+                        title="不应收录的曲目",
+                        source=f"/music/empty-{typed}.flac",
+                        duration=typed,
+                        cover_url="https://img.example/x.png",
+                        description="不应保存的说明",
+                        tags="不应保存的标签",
+                    )
+                )
+                self.assertEqual(status, 400)
+                # 不新增任何曲目：接口为空，页面仍显示没有记录。
+                self.assertEqual(self.list_tracks(), [])
+                self.assertIsNone(TRACK_LIST_RE.search(page))
+                self.assertIn("还没有曲目记录", page)
+                # 时长框保留原文，便于直接修正。
+                self.assert_form_values(page, duration=typed)
+
+
+class HomeCreateDurationInvalidWithExistingTest(ServerTestCase):
+    """已有曲目时首页时长失败：已有记录完整资料、数量与顺序保持原样。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="已有曲目·甲",
+            source="/music/existing-a.flac",
+            duration=12,
+            cover_url="https://img.example/a.png",
+            description="甲的说明\n第二行",
+            tags=["民谣"],
+        )
+        self.second = self.create_track(
+            title="已有曲目·乙", source="/music/existing-b.flac",
+            duration=33.3, tags=["现场"],
+        )
+        self.existing_ids = [self.first["id"], self.second["id"]]
+
+    def assert_library_unchanged(self, page):
+        tracks = self.list_tracks()
+        # 数量不增加，列表顺序保持原样。
+        self.assertEqual([t["id"] for t in tracks], self.existing_ids)
+        # 已有曲目的完整资料一条都没被改写。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+        # 失败页列表区仍只列出提交前的两条已有记录。
+        self.assertEqual(
+            parse_listed_tracks(page),
+            [(self.first["id"], "已有曲目·甲"),
+             (self.second["id"], "已有曲目·乙")],
+        )
+
+    def test_invalid_duration_saves_nothing_even_with_valid_metadata(self):
+        for typed in ("-1", "-0.5", "普通文字", "NaN", "Infinity",
+                      "-Infinity", "1e999", "1e1000"):
+            with self.subTest(typed=typed):
+                status, _, page = self.post_create_form(
+                    self.create_form_fields(
+                        title="不应收录的候选",
+                        source=f"/音乐/候选-{len(typed)}.flac",
+                        duration=typed,
+                        cover_url="https://img.example/candidate.png",
+                        description="候选说明\n换行",
+                        tags="候选,新编",
+                    )
+                )
+                self.assertEqual(status, 400, page[:500])
+                self.assert_form_values(page, duration=typed)
+                self.assert_library_unchanged(page)
+
+
+class HomeCreateDurationRetryAfterFailureTest(ServerTestCase):
+    """首页时长失败后只修正时长再保存：只新增一条，资料来自回填。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="已有曲目",
+            source="/music/existing.flac",
+            duration=9,
+            cover_url="https://img.example/existing.png",
+            description="已有说明",
+            tags=["已有标签"],
+        )
+
+    def test_fix_only_duration_saves_one_complete_new_record(self):
+        # 第一次：除时长外的资料全部合法，时长写成普通文字导致 400。
+        description = "失败前填写的说明：中文\n第二行换行 <img src=x>\n"
+        failed_fields = self.create_form_fields(
+            title="修正后收录的曲目",
+            source="/音乐/候选/录音.flac",
+            duration="时长未知",
+            cover_url="https://img.example/candidate.png",
+            description=description,
+            tags="候选,新编,候选",
+            save_as_new_version=True,
+        )
+        status, _, failed_page = self.post_create_form(failed_fields)
+        self.assertEqual(status, 400)
+        # 失败提交不写入任何曲目，已有记录保持原样。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], [self.first["id"]]
+        )
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+        # 用户在错误页只修正时长，保留其余回填（含另存勾选）再次保存。
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("duration", "243.5") if name == "duration" else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        new_id = int(
+            re.search(r"highlight=(\d+)$", headers["Location"]).group(1)
+        )
+        self.assertNotEqual(new_id, self.first["id"])
+
+        # 只新增一条采用回填资料与修正后时长的曲目；失败提交不留额外记录。
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], [self.first["id"], new_id]
+        )
+        self.assertEqual(tracks[-1], {
+            "id": new_id,
+            "title": "修正后收录的曲目",
+            "source": "/音乐/候选/录音.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/candidate.png",
+            "description": description,
+            "tags": ["候选", "新编"],
+        })
+        # 已有记录仍与提交前完全一致。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+        # 成功后首页显示收录成功，列表时长与接口一致。
+        status, _, listing_page = self.server.get_page(headers["Location"])
+        self.assertEqual(status, 200)
+        success = strip_tags(BANNER_SUCCESS_RE.search(listing_page).group(1))
+        self.assertIn("收录成功", success)
+        self.assertIn(f"#{new_id}", success)
+        self.assertEqual(
+            parse_listed_durations(listing_page), ["9 秒", "243.5 秒"]
+        )
+
+    def test_fix_duration_to_zero_then_to_unknown_each_adds_one_record(self):
+        # 修正为“0”：收录一条已知零秒的曲目，显示“0 秒”而非未知。
+        failed_fields = self.create_form_fields(
+            title="先负数后零", source="/music/fix-zero.flac",
+            duration="-3", description="零秒修正",
+        )
+        status, _, failed_page = self.post_create_form(failed_fields)
+        self.assertEqual(status, 400)
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("duration", "0") if name == "duration" else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        zero_id = int(headers["Location"].rsplit("=", 1)[1])
+        self.assertEqual(self.track_by_id(zero_id)["duration"], 0)
+        status, _, listing_page = self.server.get_page(headers["Location"])
+        self.assertEqual(
+            parse_listed_durations(listing_page), ["9 秒", "0 秒"]
+        )
+
+        # 另一次失败后把时长框清空修正：收录一条未知时长的新曲目。
+        failed_fields = self.create_form_fields(
+            title="先文字后留空", source="/music/fix-unknown.flac",
+            duration="abc",
+        )
+        status, _, failed_page = self.post_create_form(failed_fields)
+        self.assertEqual(status, 400)
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("duration", "") if name == "duration" else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        unknown_id = int(headers["Location"].rsplit("=", 1)[1])
+        self.assertIsNone(self.track_by_id(unknown_id)["duration"])
+        # 两次失败都没有额外记录：只有已有 + 零秒 + 未知三条。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.first["id"], zero_id, unknown_id],
+        )
+
+
+class HomeCreateDurationWithSourceRulesTest(ServerTestCase):
+    """时长保障与来源重复、另存为新版本的既有规则并存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.existing = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            tags=["民谣"],
+        )
+
+    def test_duplicate_source_with_bad_duration_still_creates_nothing(self):
+        # 来源重复且未另存、时长也非法：不新增任何记录，已有版本保持原样。
+        fields = self.create_form_fields(
+            title="夜航·候选",
+            source="/music/yehang.flac",
+            duration="abc",
+            tags=["候选"],
+        )
+        status, _, page = self.post_create_form(fields)
+        # 时长字段先于来源判重被校验，返回 400（而不是 409）。
+        self.assertEqual(status, 400, page[:500])
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(any("时长" in text for text in field_errors))
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], [self.existing["id"]]
+        )
+        self.assertEqual(self.track_by_id(self.existing["id"]), self.existing)
+
+    def test_bad_duration_then_duplicate_source_then_save_new_version(self):
+        # 第一次：时长非法被 400 拒绝（来源尚未走到判重），不留记录。
+        fields = self.create_form_fields(
+            title="夜航·重录",
+            source="/music/yehang.flac",
+            duration="NaN",
+            description="重录说明",
+            tags=["重录"],
+        )
+        status, _, failed_page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], [self.existing["id"]]
+        )
+
+        # 修正时长但仍未勾选另存：来源重复规则依旧生效，返回 409。
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("duration", "307.25") if name == "duration" else (name, value)
+            for name, value in retry_fields
+        ]
+        status, _, conflict_page = self.post_create_form(retry_fields)
+        self.assertEqual(status, 409, conflict_page[:500])
+        self.assertEqual(
+            parse_conflict_items(conflict_page),
+            [(self.existing["id"], "夜航·首版")],
+        )
+        # 冲突拒绝同样不写入，且回填保留修正后的时长与其他本次资料。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], [self.existing["id"]]
+        )
+        self.assert_form_values(
+            conflict_page,
+            title="夜航·重录",
+            source="/music/yehang.flac",
+            duration="307.25",
+            description="重录说明",
+        )
+
+        # 在冲突页勾选“另存为新版本”再保存：新增一条独立标识的版本，
+        # 资料来自回填，时长为修正后的值；原版本不被修改。
+        final_fields = self.create_fields_from_rendered_page(conflict_page)
+        final_fields.append(("save_as_new_version", "1"))
+        status, headers, _ = self.post_create_form(final_fields)
+        self.assertEqual(status, 303, headers)
+        new_id = int(headers["Location"].rsplit("=", 1)[1])
+        self.assertNotEqual(new_id, self.existing["id"])
+        new_record = self.track_by_id(new_id)
+        self.assertEqual(new_record, {
+            "id": new_id,
+            "title": "夜航·重录",
+            "source": "/music/yehang.flac",
+            "duration": 307.25,
+            "cover_url": "",
+            "description": "重录说明",
+            "tags": ["重录"],
+        })
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.existing["id"], new_id],
+        )
+        self.assertEqual(self.track_by_id(self.existing["id"]), self.existing)
 
 
 class EditTagsReplaceTest(ServerTestCase):
