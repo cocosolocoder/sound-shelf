@@ -37,6 +37,17 @@
 - 一次非法时长编辑被拒后，用同一标识提交合法时长可正常保存；本次只
   提交时长时，失败请求里尝试修改的名称、说明不会被补入，本次明确提交
   的合法新资料则与时长一起保存。
+- 时长调整的编辑页路径（GET/POST /tracks/{id}/edit，表单提交的是
+  输入框文字而非 JSON）：打开时已知时长按秒回填、未知时长框为空；
+  数字写成文字（0、243.5、首尾带空白）正常接受，清空或只填空白保存
+  为 null（列表“未知”，再打开仍为空），而不是 0；原本未知可正常补填。
+  只改时长时名称、来源、封面、说明（中文、空行、首尾空格）与标签完整
+  文字和先后关系逐字节保留；同一来源多个版本只改其中一条时长，其他
+  版本、记录数量与列表顺序不变。无法解析为有限非负数的文字（负数、
+  普通文字、NaN、Infinity、1e999 等）返回 400，顶部横幅点明“时长有误”
+  且错误提示紧跟时长框，本次文字（含同次合法名称、说明）逐字段回填，
+  记录与其他曲目保持提交前状态；只修正时长再保存时，回填的合法资料
+  一起写入，不会换回旧值。
 - 编辑页（GET/POST /tracks/{id}/edit）的标签每个标签项一个输入框：
   接口收录时按完整文字保存的标签（可含换行、中英文逗号、顿号）逐框展示，
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
@@ -100,10 +111,23 @@ TRACK_ITEM_RE = re.compile(
     r'<p class="track-title"><span class="track-id">#\d+</span>(.*?)</p>',
     re.DOTALL,
 )
+# 一条曲目内部“时长”一行：<dt>时长</dt><dd>展示文字</dd>。
+TRACK_DURATION_CELL_RE = re.compile(
+    r'<dt>时长</dt>\s*<dd[^>]*>(.*?)</dd>', re.DOTALL
+)
+# 一条曲目整体：用于在某条曲目内部定位“时长”等字段的展示文字。
+TRACK_BLOCK_RE = re.compile(
+    r'<li id="track-(\d+)"[^>]*>(.*?)</li>', re.DOTALL
+)
 FORCE_CHECKBOX_RE = re.compile(
     r'<input type="checkbox" id="f-force"[^>]*>'
 )
 FIELD_ERROR_RE = re.compile(r'<p class="field-error">(.*?)</p>', re.DOTALL)
+# 某个文本输入框紧跟的字段级错误提示：用于确认错误确实挂在指定字段旁。
+FIELD_ERROR_AFTER_INPUT_RE_TEMPLATE = (
+    r'<input type="text" id="f-{fid}" name="{name}"[^>]*?>\s*'
+    r'<p class="field-error">(.*?)</p>'
+)
 
 
 def strip_tags(markup):
@@ -183,6 +207,22 @@ def parse_listed_tracks(page):
         (int(item.group(1)), strip_tags(item.group(2)))
         for item in TRACK_ITEM_RE.finditer(match.group(1))
     ]
+
+
+def parse_listed_duration(page, track_id):
+    """提取首页列表中指定曲目“时长”一格展示给用户的纯文字。
+
+    已知时长形如“0 秒”“243.5 秒”；未知时长为“未知”（旧记录为“未填写”）。
+    """
+    block = None
+    for item in TRACK_BLOCK_RE.finditer(page):
+        if int(item.group(1)) == track_id:
+            block = item.group(2)
+            break
+    assert block is not None, f"列表中找不到曲目 #{track_id}"
+    cell = TRACK_DURATION_CELL_RE.search(block)
+    assert cell is not None, f"曲目 #{track_id} 列表项中找不到时长展示"
+    return strip_tags(cell.group(1))
 
 
 
@@ -1102,6 +1142,606 @@ class EditDurationRetryAfterRejectionTest(ServerTestCase):
         self.assertEqual(body["title"], "山涧晨曲")
         self.assertEqual(body["description"], "原始说明\n保留换行")
         self.assertIsNone(self.track_by_id(self.track_id)["duration"])
+
+
+class EditPageDurationBackfillTest(ServerTestCase):
+    """打开编辑页：已知时长按秒回填，未知时长输入框为空。"""
+
+    def setUp(self):
+        super().setUp()
+        self.known = self.create_track(
+            title="已知时长曲目", source="/music/known.flac", duration=243.5,
+        )
+        self.whole = self.create_track(
+            title="整秒时长曲目", source="/music/whole.flac", duration=307,
+        )
+        self.zero = self.create_track(
+            title="零秒曲目", source="/music/zero.flac", duration=0,
+        )
+        self.unknown = self.create_track(
+            title="未知时长曲目", source="/music/unknown.flac", duration=None,
+        )
+
+    def test_known_decimal_backfills_seconds_as_text(self):
+        page = self.get_edit_page(self.known["id"])
+        # 已知值按秒回填为输入框里的文字，小数原样保留。
+        self.assert_form_values(page, duration="243.5")
+
+    def test_known_integer_backfills_without_decimal_point(self):
+        page = self.get_edit_page(self.whole["id"])
+        self.assert_form_values(page, duration="307")
+
+    def test_zero_backfills_as_zero_not_empty(self):
+        # 0 是已知时长，必须回填“0”，不能与未知一样留空。
+        page = self.get_edit_page(self.zero["id"])
+        self.assert_form_values(page, duration="0")
+
+    def test_unknown_backfills_empty_input(self):
+        page = self.get_edit_page(self.unknown["id"])
+        self.assert_form_values(page, duration="")
+
+
+class EditPageDurationSaveValidTest(ServerTestCase):
+    """编辑页表单把时长改成 0/小数/未知：列表、接口与再次打开编辑页一致。
+
+    网页表单收到的是输入框里的文字：数字按文字提交属于正常输入，不能沿用
+    JSON 接口拒绝字符串的结果。只调整时长时名称、来源、封面、说明、标签
+    全部保留（说明含中文、空行与首尾空格；标签保留完整文字与先后关系）。
+    """
+
+    DESCRIPTION = "\n\n开头空行两段\n\n第二段：中文，逗号与 空格  \n"
+    TAGS = ["民谣", "现场，纪念、保留标点", "末尾标签"]
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description=self.DESCRIPTION,
+            tags=self.TAGS,
+        )
+        self.track_id = self.track["id"]
+        # 排在后面的曲目用于证明记录数量与列表顺序不变。
+        self.after = self.create_track(
+            title="排在后面的曲目", source="/music/after.flac", duration=8,
+        )
+        self.before_ids = [t["id"] for t in self.list_tracks()]
+
+    def form_fields(self, duration, *, title=None, description=None, tags=None):
+        """按浏览器方式构造整表：所有输入框都提交，标签逐框并带原始序号。"""
+        title = self.track["title"] if title is None else title
+        description = self.DESCRIPTION if description is None else description
+        tag_texts = self.TAGS if tags is None else tags
+        # 真实编辑页末尾总有一个用于新增标签的空框（序号留空）。
+        submitted_tags = list(tag_texts) + [""]
+        fields = self.edit_form_fields(
+            title=title,
+            source=self.track["source"],
+            duration=duration,
+            cover_url=self.track["cover_url"],
+            description=browser_newlines(description),
+            tags=[browser_newlines(text) for text in submitted_tags],
+        )
+        fields.extend(("tags_ref", str(i)) for i in range(len(tag_texts)))
+        fields.append(("tags_ref", ""))
+        return fields
+
+    def assert_save_redirects_to_list(self, headers):
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.track_id}&edited=1"
+        )
+
+    def assert_list_shows_success_and_duration(self, displayed):
+        status, _, page = self.server.get_page(
+            f"/?highlight={self.track_id}&edited=1"
+        )
+        self.assertEqual(status, 200)
+        success = strip_tags(BANNER_SUCCESS_RE.search(page).group(1))
+        # 回到曲目列表并明确提示修改成功、点出原曲目标识。
+        self.assertIn("修改成功", success)
+        self.assertIn(f"#{self.track_id}", success)
+        # 列表中该曲目时长一格展示给用户的文字。
+        self.assertEqual(
+            parse_listed_duration(page, self.track_id), displayed
+        )
+
+    def test_save_zero_shows_zero_seconds_everywhere(self):
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("0")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assert_save_redirects_to_list(headers)
+        self.assert_list_shows_success_and_duration("0 秒")
+
+        # 保存后的资料：duration 为数字 0（已知），不是 null。
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 0)
+        self.assertIsNotNone(record["duration"])
+        # 原曲目标识不变，记录数量与列表顺序不变。
+        self.assertEqual(record["id"], self.track_id)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], self.before_ids
+        )
+        # 重新进入编辑页，仍看到保存的值“0”。
+        self.assert_form_values(self.get_edit_page(self.track_id), duration="0")
+
+    def test_save_decimal_text_is_accepted_unlike_json_string(self):
+        # 表单把数字写成文字提交是正常输入：“243.5”应当作 243.5 秒保存。
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("243.5")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assert_save_redirects_to_list(headers)
+        self.assert_list_shows_success_and_duration("243.5 秒")
+
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 243.5)
+        self.assert_form_values(self.get_edit_page(self.track_id),
+                                duration="243.5")
+
+    def test_save_integer_text_keeps_integer_shape(self):
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("307")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assert_list_shows_success_and_duration("307 秒")
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 307)
+        self.assertIsInstance(record["duration"], int)
+        self.assert_form_values(self.get_edit_page(self.track_id),
+                                duration="307")
+
+    def test_numeric_text_with_surrounding_spaces_is_trimmed(self):
+        # 框内首尾空白随输入一起提交，去掉空白后仍按数字解析。
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("  243.5 ")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(self.track_id)["duration"], 243.5)
+
+    def test_clearing_duration_sets_unknown_not_zero(self):
+        # 清空时长输入框：duration 存为 null，而不是 0。
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assert_list_shows_success_and_duration("未知")
+
+        record = self.track_by_id(self.track_id)
+        self.assertIsNone(record["duration"])
+        # 再次打开编辑页，时长框仍为空。
+        self.assert_form_values(self.get_edit_page(self.track_id), duration="")
+
+    def test_whitespace_only_duration_sets_unknown_not_zero(self):
+        # 只填写空白（空格/制表符）后保存，同样视为未知，而不是 0。
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields(" \t ")
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assert_list_shows_success_and_duration("未知")
+        self.assertIsNone(self.track_by_id(self.track_id)["duration"])
+        self.assert_form_values(self.get_edit_page(self.track_id), duration="")
+
+    def test_changing_only_duration_keeps_all_other_metadata(self):
+        status, headers, page = self.post_edit_form(
+            self.track_id, self.form_fields("260.25")
+        )
+        self.assertEqual(status, 303, page[:500])
+
+        record = self.track_by_id(self.track_id)
+        # 名称、来源、封面原样保留。
+        self.assertEqual(record["title"], "山涧晨曲")
+        self.assertEqual(record["source"], "/music/shanjian.flac")
+        self.assertEqual(record["cover_url"],
+                         "https://img.example/shanjian.png")
+        # 时长更新为本次值。
+        self.assertEqual(record["duration"], 260.25)
+        # 说明的中文、开头/段落空行与首尾空格逐字节保留。
+        self.assertEqual(record["description"], self.DESCRIPTION)
+        # 标签完整文字（含中文逗号、顿号）与先后关系不变。
+        self.assertEqual(record["tags"], self.TAGS)
+
+        # 重新进入编辑页：说明框完整还原（开头空行、结尾空格都在），
+        # 标签仍是各自独立的三个框（末尾再附一个新增空框）。
+        reopened = self.get_edit_page(self.track_id)
+        self.assertEqual(parse_description_box(reopened), self.DESCRIPTION)
+        self.assert_tag_boxes(reopened, self.TAGS + [""])
+        self.assert_form_values(reopened, duration="260.25")
+
+    def test_unknown_then_zero_then_unknown_round_trip(self):
+        # 已知 -> 清空成未知 -> 填 0 -> 再清空：0 与未知始终分得清。
+        for duration_text, expected, displayed in (
+            ("", None, "未知"),
+            ("0", 0, "0 秒"),
+            ("", None, "未知"),
+        ):
+            status, headers, page = self.post_edit_form(
+                self.track_id, self.form_fields(duration_text)
+            )
+            self.assertEqual(status, 303, page[:500])
+            self.assertEqual(
+                self.track_by_id(self.track_id)["duration"], expected
+            )
+            _, _, list_page = self.server.get_page("/")
+            self.assertEqual(
+                parse_listed_duration(list_page, self.track_id), displayed
+            )
+
+
+class EditPageDurationUnknownTrackFormTest(ServerTestCase):
+    """原本未知时长的曲目：可以正常补填数字，空值不拒绝保存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="未知时长曲目",
+            source="/music/unknown.flac",
+            duration=None,
+            cover_url="https://img.example/unknown.png",
+            description="时长待补\n第二行",
+            tags=["待补"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_fill_decimal_from_unknown_succeeds(self):
+        # 原值为空不能成为拒绝保存的理由：补填 243.5 正常保存。
+        fields = self.edit_form_fields(
+            title="未知时长曲目",
+            source="/music/unknown.flac",
+            duration="243.5",
+            cover_url="https://img.example/unknown.png",
+            description="时长待补\n第二行".replace("\n", "\r\n"),
+            tags=["待补", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "")])
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.track_id}&edited=1"
+        )
+
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 243.5)
+        self.assertEqual(record["title"], "未知时长曲目")
+        self.assertEqual(record["description"], "时长待补\n第二行")
+        _, _, list_page = self.server.get_page(
+            f"/?highlight={self.track_id}&edited=1"
+        )
+        self.assertEqual(
+            parse_listed_duration(list_page, self.track_id), "243.5 秒"
+        )
+        self.assert_form_values(self.get_edit_page(self.track_id),
+                                duration="243.5")
+
+    def test_fill_zero_from_unknown_is_zero(self):
+        fields = self.edit_form_fields(
+            title="未知时长曲目",
+            source="/music/unknown.flac",
+            duration="0",
+            description="时长待补\n第二行".replace("\n", "\r\n"),
+            tags=["待补", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "")])
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 0)
+        self.assertIsNotNone(record["duration"])
+
+    def test_submitting_empty_keeps_unknown(self):
+        # 再次打开直接保存（时长仍空）：继续未知，不报错。
+        fields = self.edit_form_fields(
+            title="未知时长曲目（改名）",
+            source="/music/unknown.flac",
+            duration="",
+            description="时长待补\n第二行".replace("\n", "\r\n"),
+            tags=["待补", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "")])
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertIsNone(record["duration"])
+        self.assertEqual(record["title"], "未知时长曲目（改名）")
+        _, _, list_page = self.server.get_page("/")
+        self.assertEqual(
+            parse_listed_duration(list_page, self.track_id), "未知"
+        )
+        self.assert_form_values(self.get_edit_page(self.track_id), duration="")
+
+    def test_invalid_text_from_unknown_is_rejected_and_stays_unknown(self):
+        fields = self.edit_form_fields(
+            title="未知时长曲目",
+            source="/music/unknown.flac",
+            duration="abc",
+            description="时长待补\n第二行".replace("\n", "\r\n"),
+            tags=["待补", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "")])
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        # 仍是未知，没有写入 0 或其他值。
+        self.assertIsNone(self.track_by_id(self.track_id)["duration"])
+        self.assert_form_values(page, duration="abc")
+
+
+class EditPageDurationSameSourceVersionsTest(ServerTestCase):
+    """同一来源已有多个独立版本：保留来源只改其中一条时长，其余不受影响。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            description="首版说明",
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            description="重制说明",
+            save_as_new_version=True,
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=9,
+        )
+
+    def test_edit_duration_of_one_version_keeps_source_and_others(self):
+        # 保留相同来源，只把首版时长改成 0；无标签的编辑页仍渲染一个
+        # 空标签框并带空序号，按浏览器的实际提交一并带上。
+        fields = self.edit_form_fields(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration="0",
+            description="首版说明",
+            tags=[""],
+        )
+        fields.append(("tags_ref", ""))
+        status, headers, page = self.post_edit_form(self.first["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.first['id']}&edited=1"
+        )
+
+        tracks = self.list_tracks()
+        # 记录数量不变，顺序仍是标识升序。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.first["id"], self.second["id"], self.bystander["id"]],
+        )
+        edited = self.track_by_id(self.first["id"])
+        # 来源保留，时长改成本次值，名称与说明不变。
+        self.assertEqual(edited["source"], "/music/yehang.flac")
+        self.assertEqual(edited["duration"], 0)
+        self.assertEqual(edited["title"], "夜航·首版")
+        self.assertEqual(edited["description"], "首版说明")
+        # 同来源的另一版本整条资料原样保留，没有被合并或覆盖。
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+        self.assertEqual(
+            self.track_by_id(self.bystander["id"]), self.bystander
+        )
+
+
+class EditPageDurationInvalidFormTest(ServerTestCase):
+    """编辑页表单提交无法解析为有限非负数的时长：400、指出时长有误并回填。
+
+    即使同时改了合法的名称或说明，这次失败也不能先保存那些资料；
+    原记录与其他曲目保持提交前状态，页面回填本次填写的全部内容。
+    """
+
+    DESCRIPTION = "原始说明\n含中文与换行"
+    BAD_DURATIONS = ("-1", "-0.5", "abc", "时长", "NaN", "Infinity",
+                     "-Infinity", "1e999")
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description=self.DESCRIPTION,
+            tags=["纯音乐", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=33.3,
+        )
+        self.all_ids = [self.track_id, self.bystander["id"]]
+
+    def test_bad_durations_are_rejected_with_reprint_and_no_partial_save(self):
+        new_title = "本次想改的新名称"
+        new_description = "本次想改的新说明\n第二行"
+
+        for bad in self.BAD_DURATIONS:
+            with self.subTest(bad=bad):
+                fields = self.edit_form_fields(
+                    title=new_title,
+                    source="/music/shanjian.flac",
+                    duration=bad,
+                    cover_url="https://img.example/shanjian.png",
+                    description=new_description.replace("\n", "\r\n"),
+                    tags=["纯音乐", "现场", ""],
+                )
+                fields.extend([("tags_ref", "0"), ("tags_ref", "1"),
+                               ("tags_ref", "")])
+                status, _, page = self.post_edit_form(self.track_id, fields)
+                self.assertEqual(status, 400)
+
+                # 页面明确指出时长有误：顶部横幅点明“时长有误”，且字段级
+                # 错误提示紧跟在时长输入框旁（不能错挂到名称等其他字段）。
+                banner = BANNER_ERROR_RE.search(page)
+                self.assertIsNotNone(banner)
+                banner_text = strip_tags(banner.group(1))
+                self.assertIn("时长", banner_text)
+                self.assertIn("有误", banner_text)
+                duration_field_error = re.search(
+                    FIELD_ERROR_AFTER_INPUT_RE_TEMPLATE.format(
+                        fid="duration", name="duration"
+                    ),
+                    page, re.DOTALL,
+                )
+                self.assertIsNotNone(
+                    duration_field_error,
+                    f"时长输入框旁应显示字段级错误，实际字段提示："
+                    f"{[strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]}",
+                )
+                self.assertIn("时长", strip_tags(duration_field_error.group(1)))
+
+                # 时长框原样回填本次填写的文字（NaN、Infinity、1e999 等），
+                # 合法的新名称、新说明也回填，便于继续编辑。
+                self.assert_form_values(
+                    page, title=new_title, duration=bad
+                )
+                self.assertEqual(parse_description_box(page), new_description)
+
+                # 原记录整条保持提交前状态：同次合法的名称、说明没有先写入，
+                # 时长也没有变成 0 或 null；其他曲目、数量与顺序不变。
+                self.assertEqual(self.track_by_id(self.track_id), self.track)
+                self.assertEqual(
+                    self.track_by_id(self.bystander["id"]), self.bystander
+                )
+                self.assertEqual(
+                    [t["id"] for t in self.list_tracks()], self.all_ids
+                )
+
+    def test_negative_duration_reprint_stays_on_edit_form_for_same_id(self):
+        # 失败重绘仍是针对原曲目标识的编辑表单，修正后仍提交到同一地址。
+        fields = self.edit_form_fields(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration="-5",
+            description=self.DESCRIPTION.replace("\n", "\r\n"),
+            tags=["纯音乐", "现场", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "1"),
+                       ("tags_ref", "")])
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertIn(
+            f'action="/tracks/{self.track_id}/edit"', page
+        )
+        self.assert_form_values(page, duration="-5")
+
+
+class EditPageDurationRetryAfterFormFailureTest(ServerTestCase):
+    """表单里时长出错被拒后，仅修正时长：本次合法修改一起写入。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="原始说明\n保留换行",
+            tags=["纯音乐"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=7,
+        )
+
+    def test_fix_only_duration_saves_the_new_metadata_too(self):
+        new_title = "山涧晨曲（定稿）"
+        new_description = "定稿说明\n第二行：鸟鸣"
+
+        # 第一次：合法新名称、新说明 + 负数时长，被 400 拒绝；什么都没存。
+        fields = self.edit_form_fields(
+            title=new_title,
+            source="/music/shanjian.flac",
+            duration="-5",
+            cover_url="https://img.example/shanjian.png",
+            description=new_description.replace("\n", "\r\n"),
+            tags=["纯音乐", ""],
+        )
+        fields.extend([("tags_ref", "0"), ("tags_ref", "")])
+        status, _, failed_page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 失败页面回填本次名称、说明与出错的时长。
+        self.assert_form_values(
+            failed_page, title=new_title, duration="-5"
+        )
+        self.assertEqual(parse_description_box(failed_page), new_description)
+
+        # 失败页面逐框回填了标签（含空框）与各自序号；用户只修正时长，
+        # 其余按页面原样重新提交：模拟在回填页面上直接重试。
+        reprinted_boxes = parse_tag_boxes(failed_page)
+        reprinted_refs = parse_tag_refs(failed_page)
+        self.assertEqual(len(reprinted_refs), len(reprinted_boxes))
+        reprinted_description = parse_description_box(failed_page)
+        fields = self.edit_form_fields(
+            title=new_title,
+            source="/music/shanjian.flac",
+            duration="243.5",
+            cover_url="https://img.example/shanjian.png",
+            description=reprinted_description.replace("\n", "\r\n"),
+            tags=[box.replace("\n", "\r\n") for box in reprinted_boxes],
+        )
+        fields.extend(("tags_ref", ref) for ref in reprinted_refs)
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.track_id}&edited=1"
+        )
+
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record, {
+            "id": self.track_id,
+            "title": new_title,
+            "source": "/music/shanjian.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/shanjian.png",
+            "description": new_description,
+            "tags": ["纯音乐"],
+        })
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.track_id, self.bystander["id"]],
+        )
+        self.assertEqual(
+            self.track_by_id(self.bystander["id"]), self.bystander
+        )
+        # 再次打开编辑页，看到的是修正后的时长与本次新资料。
+        reopened = self.get_edit_page(self.track_id)
+        self.assert_form_values(
+            reopened, title=new_title, duration="243.5"
+        )
+        self.assertEqual(parse_description_box(reopened), new_description)
+
+    def test_fix_duration_to_unknown_saves_new_title_and_null(self):
+        new_title = "改成未知时长的新名称"
+        # 第一次：普通文字时长失败。
+        fields = self.edit_form_fields(
+            title=new_title,
+            source="/music/shanjian.flac",
+            duration="abc",
+            description="原始说明\n保留换行".replace("\n", "\r\n"),
+            tags=["纯音乐"],
+        )
+        fields.append(("tags_ref", "0"))
+        status, _, failed_page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+        # 只把时长清空（设为未知）后继续保存：新名称一起写入，时长为 null。
+        fields = self.edit_form_fields(
+            title=new_title,
+            source="/music/shanjian.flac",
+            duration="",
+            description="原始说明\n保留换行".replace("\n", "\r\n"),
+            tags=["纯音乐"],
+        )
+        fields.append(("tags_ref", "0"))
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], new_title)
+        self.assertIsNone(record["duration"])
 
 
 class EditPageTagBoxesTest(ServerTestCase):
