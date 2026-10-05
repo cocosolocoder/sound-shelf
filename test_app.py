@@ -138,6 +138,12 @@ DESCRIPTION_RE = re.compile(
     r'<textarea id="f-description" name="description">(.*?)</textarea>',
     re.DOTALL,
 )
+# 编辑页的来源同样是多行输入框（来源按文字保存，内部分行原样呈现）；
+# 首页收录表单仍使用单行 input。
+SOURCE_TEXTAREA_RE = re.compile(
+    r'<textarea id="f-source" name="source"[^>]*>(.*?)</textarea>',
+    re.DOTALL,
+)
 BANNER_ERROR_RE = re.compile(
     r'<p class="banner error" role="alert">(.*?)</p>', re.DOTALL
 )
@@ -210,6 +216,23 @@ def parse_description_box(page):
     elif inner.startswith(("\n", "\r")):
         inner = inner[1:]
     return inner.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def parse_textarea_shown(regex, page, label):
+    """提取某个 textarea 在浏览器中呈现的文字（与说明框同一套解析规则）。"""
+    match = regex.search(page)
+    assert match is not None, f"页面中找不到{label}输入框"
+    inner = html.unescape(match.group(1))
+    if inner.startswith("\r\n"):
+        inner = inner[2:]
+    elif inner.startswith(("\n", "\r")):
+        inner = inner[1:]
+    return inner.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def parse_source_box(page):
+    """提取编辑页来源多行框在浏览器中呈现的完整文字（含内部换行与空格）。"""
+    return parse_textarea_shown(SOURCE_TEXTAREA_RE, page, "来源")
 
 
 def description_box_markup(page):
@@ -477,7 +500,7 @@ class ServerTestCase(unittest.TestCase):
         """
         fields = [
             ("title", parse_input_value(page, "title", "title")),
-            ("source", parse_input_value(page, "source", "source")),
+            ("source", parse_source_box(page)),
             ("duration", parse_input_value(page, "duration", "duration")),
             ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
             ("description", parse_description_box(page)),
@@ -508,7 +531,13 @@ class ServerTestCase(unittest.TestCase):
         if title is not None:
             self.assertEqual(parse_input_value(page, "title", "title"), title)
         if source is not None:
-            self.assertEqual(parse_input_value(page, "source", "source"), source)
+            # 编辑页来源是多行框，首页收录表单仍是单行输入框。
+            source_match = SOURCE_TEXTAREA_RE.search(page)
+            shown_source = (
+                parse_source_box(page) if source_match
+                else parse_input_value(page, "source", "source")
+            )
+            self.assertEqual(shown_source, source)
         if duration is not None:
             self.assertEqual(
                 parse_input_value(page, "duration", "duration"), duration
@@ -2396,6 +2425,525 @@ class EditPageTagNewlinePreservationTest(ServerTestCase):
         record = self.track_by_id(self.track_id)
         self.assertEqual(record["source"], "/music/shanjian-2.flac")
         self.assertEqual(record["tags"], self.INITIAL_TAGS)
+
+
+class EditPageSourceRenderTest(ServerTestCase):
+    """打开编辑页：来源多行框完整还原已保存来源的内部文字、空格与分行。"""
+
+    SOURCE = (
+        "https://example.com/a\r\n"
+        "  第二行前后保留空格  \r"
+        "第三行（CR 换行）\n"
+        "  第四行"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="多换行来源曲目",
+            source=self.SOURCE,
+            duration=212,
+            description="说明照常保留",
+            tags=["标签"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_edit_page_renders_full_internal_text(self):
+        page = self.get_edit_page(self.track_id)
+        # 浏览器把框内标记中的 CRLF/CR 视为 LF：呈现文字的内部空格与分行
+        # 全部在相同位置，只把换行形态统一显示。
+        self.assertEqual(
+            parse_source_box(page),
+            "https://example.com/a\n"
+            "  第二行前后保留空格  \n"
+            "第三行（CR 换行）\n"
+            "  第四行",
+        )
+        # 标记中真实包含两行文字（原文 CRLF 逐字节保留），而不是并成一行。
+        self.assertIn("https://example.com/a\r\n  第二行前后保留空格", page)
+
+    def test_leading_newline_in_typed_source_is_compensated_on_reprint(self):
+        # 已保存来源不含首尾空白；开头换行补偿出现在失败重绘场景：
+        # 用户把来源改成以换行开头的文字但时长填错，回填框仍要呈现开头空行。
+        fields = self.edit_form_fields(
+            title="多换行来源曲目",
+            source="\nhttps://example.com/leading.flac\n结尾行",
+            duration="bad",
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            parse_source_box(page),
+            "\nhttps://example.com/leading.flac\n结尾行",
+        )
+
+    def test_source_html_looking_text_is_escaped(self):
+        track = self.create_track(
+            title="特殊字符来源",
+            source="/music/<b>看起来像标签</b>&引号.flac",
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(
+            parse_source_box(page),
+            "/music/<b>看起来像标签</b>&引号.flac",
+        )
+        self.assertIn("&lt;b&gt;", page)
+        self.assertNotIn("<b>看起来", page)
+
+
+class EditPageSourceUntouchedSaveTest(ServerTestCase):
+    """没改来源（或只增删首尾空白）只保存其他资料：来源原文逐字节保留。"""
+
+    CRLF_SOURCE = "line1\r\nline2"
+    LF_SOURCE = "line1\nline2"
+    CR_SOURCE = "a\rb"
+    MIXED_SOURCE = "首行 \r\n 次行 \r 三行 \n尾行"
+
+    def setUp(self):
+        super().setUp()
+        self.crlf_track = self.create_track(
+            title="CRLF 换行来源", source=self.CRLF_SOURCE, duration=10,
+        )
+        self.lf_track = self.create_track(
+            title="LF 换行来源", source=self.LF_SOURCE, duration=20,
+            save_as_new_version=True,
+        )
+        self.cr_track = self.create_track(
+            title="CR 换行来源", source=self.CR_SOURCE,
+            save_as_new_version=True,
+        )
+        self.mixed_track = self.create_track(
+            title="混合换行与首尾空白来源", source=self.MIXED_SOURCE,
+            save_as_new_version=True,
+        )
+
+    def save_via_rendered_page(self, track_id, *, title=None,
+                               duration=None, source_override=None):
+        """打开真实编辑页取回整表（换行按浏览器 CRLF 发送）后保存。"""
+        page = self.get_edit_page(track_id)
+        fields = self.edit_fields_from_rendered_page(page)
+        if title is not None:
+            fields = self.form_with_field(fields, "title", title)
+        if duration is not None:
+            fields = self.form_with_field(fields, "duration", duration)
+        if source_override is not None:
+            fields = self.form_with_field(fields, "source", source_override)
+        fields = [
+            (name, browser_newlines(value)) if name in ("source", "description", "tags")
+            else (name, value)
+            for name, value in fields
+        ]
+        status, headers, resp = self.post_edit_form(track_id, fields)
+        self.assertEqual(status, 303, resp[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track_id}&edited=1"
+        )
+
+    def test_change_only_title_keeps_each_newline_variant_raw(self):
+        self.save_via_rendered_page(self.crlf_track["id"], title="CRLF 改名")
+        self.save_via_rendered_page(self.lf_track["id"], title="LF 改名")
+        self.save_via_rendered_page(self.cr_track["id"], title="CR 改名")
+        self.save_via_rendered_page(self.mixed_track["id"], title="混合 改名")
+
+        self.assertEqual(
+            self.track_by_id(self.crlf_track["id"])["source"], self.CRLF_SOURCE
+        )
+        self.assertEqual(
+            self.track_by_id(self.lf_track["id"])["source"], self.LF_SOURCE
+        )
+        self.assertEqual(
+            self.track_by_id(self.cr_track["id"])["source"], self.CR_SOURCE
+        )
+        self.assertEqual(
+            self.track_by_id(self.mixed_track["id"])["source"], self.MIXED_SOURCE
+        )
+
+    def test_newline_variants_remain_separate_records(self):
+        # 仅换行写法不同的两段来源不因打开编辑页保存而变成同一段。
+        self.save_via_rendered_page(self.crlf_track["id"], title="CRLF 再改名")
+        self.save_via_rendered_page(self.lf_track["id"], title="LF 再改名")
+        sources = {
+            t["id"]: t["source"] for t in self.list_tracks()
+            if t["id"] in (self.crlf_track["id"], self.lf_track["id"])
+        }
+        self.assertEqual(len(set(sources.values())), 2)
+        self.assertIn("\r\n", sources[self.crlf_track["id"]])
+        self.assertNotIn("\r", sources[self.lf_track["id"]])
+
+    def test_change_only_duration_keeps_source_raw(self):
+        self.save_via_rendered_page(self.crlf_track["id"], duration="300")
+        record = self.track_by_id(self.crlf_track["id"])
+        self.assertEqual(record["duration"], 300)
+        self.assertEqual(record["source"], self.CRLF_SOURCE)
+
+    def test_edge_whitespace_only_change_keeps_original(self):
+        # 用户只给来源整段首尾加了空白：视为未修改，内部换行写法保留。
+        page = self.get_edit_page(self.crlf_track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(
+            fields, "source", "  " + parse_source_box(page).replace("\n", "\r\n") + "\t "
+        )
+        status, headers, resp = self.post_edit_form(self.crlf_track["id"], fields)
+        self.assertEqual(status, 303, resp[:500])
+        self.assertEqual(
+            self.track_by_id(self.crlf_track["id"])["source"], self.CRLF_SOURCE
+        )
+
+    def test_newline_stripped_collision_does_not_block_untouched_save(self):
+        # 另一曲目来源恰好等于把本曲来源换行去掉后的文字；未改来源保存
+        # 其他资料仍应成功，两段来源各自保留。
+        self.create_track(title="去掉换行后相同", source="line1line2")
+        self.save_via_rendered_page(self.crlf_track["id"], title="不受影响的改名")
+        self.assertEqual(
+            self.track_by_id(self.crlf_track["id"])["source"], self.CRLF_SOURCE
+        )
+
+    def test_shared_source_versions_metadata_save_still_succeeds(self):
+        first = self.create_track(title="首版", source="/music/shared.flac")
+        second = self.create_track(
+            title="重制", source="/music/shared.flac",
+            save_as_new_version=True,
+        )
+        third = self.create_track(
+            title="现场", source="/music/shared.flac",
+            save_as_new_version=True,
+        )
+        self.save_via_rendered_page(second["id"], title="重制（修订）", duration="99")
+        self.assertEqual(
+            self.track_by_id(second["id"])["source"], "/music/shared.flac"
+        )
+        self.assertEqual(self.track_by_id(first["id"]), first)
+        self.assertEqual(self.track_by_id(third["id"]), third)
+
+    def test_repeated_untouched_saves_keep_source_stable(self):
+        for round_index in range(2):
+            self.save_via_rendered_page(
+                self.mixed_track["id"], title=f"第 {round_index} 次改名"
+            )
+            self.assertEqual(
+                self.track_by_id(self.mixed_track["id"])["source"], self.MIXED_SOURCE
+            )
+
+
+class EditPageSourceChangesTest(ServerTestCase):
+    """确实修改来源：按本次填写（去首尾空白、内部换行统一 LF）保存并判重。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="待改来源曲目",
+            source="https://old.example.com/a.flac",
+            duration=100,
+            cover_url="https://img.example/old.png",
+            description="原始说明",
+            tags=["原始"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_modified_source_is_trimmed_with_lf_internal_newlines(self):
+        fields = self.edit_form_fields(
+            title="待改来源曲目",
+            source="  https://new.example.com/a\r\n第二行  ",
+            duration="100",
+            cover_url="https://img.example/old.png",
+            description="原始说明",
+            tags=["原始"],
+        )
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(
+            record["source"], "https://new.example.com/a\n第二行"
+        )
+        # 其他未改资料保持原样，标识不变。
+        self.assertEqual(record["cover_url"], "https://img.example/old.png")
+        self.assertEqual(record["description"], "原始说明")
+        self.assertEqual(record["tags"], ["原始"])
+
+        # 再次打开编辑页，来源框呈现保存结果。
+        self.assertEqual(
+            parse_source_box(self.get_edit_page(self.track_id)),
+            "https://new.example.com/a\n第二行",
+        )
+
+    def test_exact_full_text_conflict_is_rejected_with_occupant(self):
+        occupied_a = self.create_track(title="占用者·版本一", source="/music/taken.flac")
+        occupied_b = self.create_track(
+            title="占用者·版本二", source="/music/taken.flac",
+            save_as_new_version=True,
+        )
+        fields = self.edit_form_fields(
+            title="待改来源曲目",
+            source="/music/taken.flac",
+            duration="100",
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            parse_conflict_items(page),
+            [(occupied_a["id"], "占用者·版本一"),
+             (occupied_b["id"], "占用者·版本二")],
+        )
+        # 被编辑曲目与占用者都保持原样，不覆盖、不合并。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        self.assertEqual(self.track_by_id(occupied_a["id"]), occupied_a)
+        self.assertEqual(self.track_by_id(occupied_b["id"]), occupied_b)
+
+    def test_conflict_after_changing_internal_newlines_uses_full_text(self):
+        # 原来源改成与其他曲目完整文字一致（含内部换行）时拒绝；
+        # 仅大小写或内部空格不同的文字不算冲突。
+        occupant = self.create_track(title="多行占用者", source="one\ntwo")
+        for source, should_conflict in (
+            ("one\r\ntwo", True),       # 归一化后完整文字一致
+            ("One\nTwo", False),        # 仅大小写不同
+            ("one \ntwo", False),       # 仅内部空格不同
+            ("one-two", False),         # 文字不同
+        ):
+            with self.subTest(source=repr(source)):
+                fields = self.edit_form_fields(
+                    title="尝试改名", source=source, duration="100",
+                )
+                status, _, page = self.post_edit_form(self.track_id, fields)
+                if should_conflict:
+                    self.assertEqual(status, 409, page[:300])
+                    self.assertEqual(
+                        parse_conflict_items(page),
+                        [(occupant["id"], "多行占用者")],
+                    )
+                else:
+                    self.assertEqual(status, 303, page[:300])
+                    # 还原成空闲来源，便于下一个子例继续。
+                    restore = self.edit_form_fields(
+                        title="待改来源曲目", source="https://free.example/x",
+                        duration="100",
+                    )
+                    status2, _, restore_page = self.post_edit_form(
+                        self.track_id, restore
+                    )
+                    self.assertEqual(status2, 303, restore_page[:300])
+
+    def test_name_similarity_never_counts_as_conflict(self):
+        self.create_track(
+            title="同名曲目", source="https://other.example/x.flac",
+        )
+        fields = self.edit_form_fields(
+            title="同名曲目",  # 名称与另一曲目相同
+            source="https://new.example/y.flac",
+            duration="100",
+        )
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["source"],
+            "https://new.example/y.flac",
+        )
+
+    def test_modified_source_conflict_does_not_save_other_fields(self):
+        self.create_track(title="占用者", source="/music/taken.flac")
+        fields = self.edit_form_fields(
+            title="不应保存的新名称",
+            source="/music/taken.flac",
+            duration="180",
+            cover_url="https://img.example/new.png",
+            description="不应保存的新说明",
+            tags=["不应", "保存"],
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 409)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+
+class EditPageSourceSaveFailureTest(ServerTestCase):
+    """时长错误或来源冲突：记录不变，页面保留本次来源，修正后按预期保存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="https://old.example.com/a.flac",
+            duration=212,
+            description="原始说明",
+            tags=["纯音乐"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_bad_duration_reprints_changed_source_and_keeps_record_intact(self):
+        fields = self.edit_form_fields(
+            title="山涧晨曲",
+            source="新来源第一行\r\n第二行",
+            duration="-5",
+            description="原始说明",
+            tags=["纯音乐"],
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        # 本次填写的完整来源（内部换行按 LF）回填。
+        self.assertEqual(parse_source_box(page), "新来源第一行\n第二行")
+        # 整条记录保持原样。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+    def test_fix_only_duration_saves_changed_source_from_reprint(self):
+        fields = self.edit_form_fields(
+            title="山涧晨曲",
+            source="新来源第一行\r\n第二行",
+            duration="bad",
+            description="原始说明",
+            tags=["纯音乐"],
+        )
+        status, _, failed_page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+
+        # 从失败页取回整表，只把时长修正，来源按回填内容以浏览器 CRLF 再提交。
+        retry_fields = self.edit_fields_from_rendered_page(failed_page)
+        retry_fields = self.form_with_field(retry_fields, "duration", "240")
+        retry_fields = [
+            (name, browser_newlines(value)) if name in ("source", "description", "tags")
+            else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, page = self.post_edit_form(self.track_id, retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 240)
+        # 失败前确实改过的来源在修正后采用回填内容（内部换行统一 LF）。
+        self.assertEqual(record["source"], "新来源第一行\n第二行")
+
+    def test_untouched_multiline_source_survives_failure_roundtrip(self):
+        track = self.create_track(
+            title="多换行", source="line1\r\nline2", duration=10,
+        )
+        fields = self.edit_form_fields(
+            title="多换行", source="line1\r\nline2", duration="bad",
+        )
+        status, _, failed_page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        retry_fields = self.edit_fields_from_rendered_page(failed_page)
+        retry_fields = self.form_with_field(retry_fields, "duration", "33")
+        retry_fields = [
+            (name, browser_newlines(value)) if name in ("source", "description", "tags")
+            else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["duration"], 33)
+        # 未改的来源经过错误页面仍保留原始 CRLF 写法。
+        self.assertEqual(record["source"], "line1\r\nline2")
+
+    def test_conflict_reprints_submitted_source_for_editing(self):
+        self.create_track(title="占用者", source="/music/taken.flac")
+        fields = self.edit_form_fields(
+            title="山涧晨曲",
+            source="/music/taken.flac",
+            duration="212",
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 409)
+        self.assertEqual(parse_source_box(page), "/music/taken.flac")
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+        # 在回填页把来源改成空闲文字后直接保存成功。
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.form_with_field(
+            retry_fields, "source", "/music/fresh.flac"
+        )
+        status, headers, retry_page = self.post_edit_form(
+            self.track_id, retry_fields
+        )
+        self.assertEqual(status, 303, retry_page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["source"], "/music/fresh.flac"
+        )
+
+
+class EditPageSourceClearAndLegacyTest(ServerTestCase):
+    """已有来源不能清空；缺少来源的旧记录仍可留空编辑。"""
+
+    def test_existing_source_cannot_be_cleared(self):
+        track = self.create_track(title="有来源", source="/music/has.flac")
+        for typed in ("", "   ", "\t\n  \r"):
+            with self.subTest(typed=repr(typed)):
+                fields = self.edit_form_fields(
+                    title="有来源", source=typed, duration="12",
+                )
+                status, _, page = self.post_edit_form(track["id"], fields)
+                self.assertEqual(status, 400, page[:300])
+                self.assertEqual(
+                    self.track_by_id(track["id"])["source"], "/music/has.flac"
+                )
+
+    def test_legacy_record_keeps_missing_source_when_left_blank(self):
+        legacy_id = self.server.insert_legacy("旧记录")
+        fields = self.edit_form_fields(
+            title="旧记录（补名称）", source="", duration="9",
+        )
+        status, headers, page = self.post_edit_form(legacy_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(legacy_id)
+        self.assertIsNone(record["source"])
+        self.assertEqual(record["title"], "旧记录（补名称）")
+        self.assertEqual(record["duration"], 9)
+
+    def test_legacy_assigning_occupied_source_still_rejected(self):
+        legacy_id = self.server.insert_legacy("旧记录")
+        self.create_track(title="正常曲目", source="/music/normal.flac")
+        fields = self.edit_form_fields(
+            title="旧记录", source="/music/normal.flac",
+        )
+        status, _, page = self.post_edit_form(legacy_id, fields)
+        self.assertEqual(status, 409)
+        self.assertIsNone(self.track_by_id(legacy_id)["source"])
+
+    def test_legacy_can_fill_a_free_multiline_source(self):
+        legacy_id = self.server.insert_legacy("旧记录")
+        fields = self.edit_form_fields(
+            title="旧记录", source="/music/a.flac\r\n第二行",
+        )
+        status, headers, page = self.post_edit_form(legacy_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(legacy_id)["source"], "/music/a.flac\n第二行"
+        )
+
+
+class EditPageSourceApiUnchangedTest(ServerTestCase):
+    """接口收录与接口编辑仍只去首尾空白、保留内部原文，不检查可播放性。"""
+
+    def test_api_create_keeps_internal_newlines_raw(self):
+        for source in ("a\r\nb", "a\rb", "a\n b \nc", "  x\ty\n"):
+            with self.subTest(source=repr(source)):
+                status, body = self.server.request(
+                    "POST", "/api/tracks",
+                    {"title": "接口来源", "source": source},
+                )
+                self.assertEqual(status, 201, body)
+                self.assertEqual(body["source"], source.strip())
+
+    def test_api_patch_trims_edges_but_keeps_internals(self):
+        track = self.create_track(title="曲目", source="/music/x.flac")
+        status, body = self.patch(
+            track["id"], {"source": "  /music/a.flac\r\n第二行\t"}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["source"], "/music/a.flac\r\n第二行")
+        # 再次列表读到的来源与保存结果逐字一致。
+        self.assertEqual(
+            [t for t in self.list_tracks() if t["id"] == track["id"]][0]["source"],
+            "/music/a.flac\r\n第二行",
+        )
+
+    def test_api_conflict_compares_full_text_not_newline_stripped(self):
+        self.create_track(title="甲", source="one\ntwo")
+        status, body = self.server.request(
+            "POST", "/api/tracks", {"title": "乙", "source": "onetwo"},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["source"], "onetwo")
+        status, body = self.server.request(
+            "POST", "/api/tracks", {"title": "丙", "source": "one\r\ntwo"},
+        )
+        self.assertEqual(status, 201, body)
 
 
 class EditPageDescriptionRenderTest(ServerTestCase):
