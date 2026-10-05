@@ -725,7 +725,9 @@ def form_to_payload(form, *, edit_mode=False):
 
     if edit_mode:
         # 每个同名字段对应编辑页的一个标签输入框，字段内部的换行原样保留；
-        # 浏览器按 CRLF 提交，统一归一化为 LF，使保存结果与接口原文收录一致。
+        # 浏览器按 CRLF 提交，这里先统一归一化为 LF，仅用于回填与“画面文字
+        # 是否相同”的比较。未改动的框最终保留原项的换行写法（LF/CRLF/CR），
+        # 由调用方通过 merge_edit_tags 按原文字合并，不直接按这里的 LF 形态保存。
         tags = [normalize_newlines(part) for part in form.get("tags", [])]
         # 说明框同样会被浏览器按 CRLF 提交：先归一化为 LF，调用方再据此
         # 判断用户是否真的改过说明，改了才按本次文字（LF 换行）保存。
@@ -744,6 +746,45 @@ def form_to_payload(form, *, edit_mode=False):
         "save_as_new_version": one("save_as_new_version") in ("1", "on", "true", "yes"),
     }
     return payload
+
+
+def merge_edit_tags(submitted_tags, old_tags):
+    """把编辑页逐框提交的标签与原标签合并，保留未改项的原始换行写法。
+
+    submitted_tags 为按框顺序提交的文字（换行已归一化为 LF）；old_tags 为
+    接口收录后保存的完整原文，项内可能是 LF、CRLF 或单独 CR。浏览器显示
+    与提交的换行写法不同不算修改：提交项去掉首尾空白后的画面文字若与某个
+    尚未匹配的原项（同样归一化换行、去首尾空白）一致，就保留该原项的完整
+    原文，包括它自己的换行写法；仅给整项首尾增加空白也属于未修改。
+    画面文字确实改动过或新增的项按本次填写保存（已统一为 LF）；未被任何
+    提交框匹配的原项视为已删除。删除、新增都不改变留下标签的相对顺序。
+
+    返回的列表仍会经过统一的标签规则（去首尾空白、忽略空项、按最终完整
+    文字首次出现去重），因此修改或新增后的正常去重不受影响；反过来，仅
+    换行写法不同的两个原项在这里不会被提前合并。
+    """
+    normalized_old = [normalize_newlines(item) for item in old_tags]
+    used = [False] * len(old_tags)
+    merged = []
+    for part in submitted_tags:
+        key = part.strip()
+        if not key:
+            # 空框（含只有空白的框）原样交给统一规则忽略。
+            merged.append(part)
+            continue
+        match_index = None
+        for index, old_text in enumerate(normalized_old):
+            if not used[index] and old_text.strip() == key:
+                match_index = index
+                break
+        if match_index is None:
+            # 画面文字确实不同：修改或新增，按本次填写（LF）保存。
+            merged.append(part)
+        else:
+            # 画面文字相同（仅换行写法或首尾空白不同）：保留原项原文。
+            used[match_index] = True
+            merged.append(old_tags[match_index])
+    return merged
 
 
 def main():
@@ -914,6 +955,13 @@ def main():
                     record["description"]
                 ):
                     del payload["description"]
+                # 标签按框逐项与原标签对齐：画面文字未改的框（浏览器把换行
+                # 统一成 CRLF 提交、或只给整项首尾加了空白）保留原项的完整
+                # 原文与换行写法（LF/CRLF/CR），仅换行写法不同的两项不会因此
+                # 被合并；确实修改或新增的项按本次填写（LF）参与统一去重。
+                payload["tags"] = merge_edit_tags(
+                    payload["tags"], record["tags"]
+                )
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
                 # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
                 if record["source"] is None and not payload["source"].strip():

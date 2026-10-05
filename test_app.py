@@ -1391,6 +1391,202 @@ class EditPageTagSaveFailureTest(ServerTestCase):
         self.assert_form_values(reopened, duration="240")
 
 
+class EditPageTagNewlinePreservationTest(ServerTestCase):
+    """未修改的标签项保留接口收录时的换行原文（LF/CRLF/单独 CR）。
+
+    接口允许同一项内出现任意换行写法；浏览器把框内换行统一按 CRLF 显示
+    和提交，这不算用户修改。直接保存或只改名称时，各项原来的完整文字、
+    项数与顺序都必须保留；仅换行写法不同的两项也不能被合并。
+    """
+
+    CRLF_TAG = "自然\r\n雨声"
+    LF_TAG = "自然\n雨声"
+    CR_TAG = "自然\r雨声"
+    PUNCT_TAG = "晨间，鸟鸣、溪流"
+    INITIAL_TAGS = [CRLF_TAG, LF_TAG, CR_TAG, PUNCT_TAG]
+
+    @staticmethod
+    def browser_text(text):
+        """浏览器提交 textarea：框内 LF/CRLF/CR 换行一律按 CRLF 编码。"""
+        return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="换行写法曲目",
+            source="/music/newlines.flac",
+            duration=212,
+            description="清晨山涧录音",
+            tags=self.INITIAL_TAGS,
+        )
+        self.track_id = self.track["id"]
+
+    def save_form(self, tags, *, title="换行写法曲目", duration="212"):
+        fields = self.edit_form_fields(
+            title=title,
+            source="/music/newlines.flac",
+            duration=duration,
+            description="清晨山涧录音",
+            tags=[self.browser_text(text) for text in tags],
+        )
+        return self.post_edit_form(self.track_id, fields)
+
+    def test_api_stored_newline_variants_are_distinct(self):
+        # 前置保障：三种换行写法的标签按完整文字独立保存。
+        self.assertEqual(self.track["tags"], self.INITIAL_TAGS)
+        self.assertIn("\r\n", self.track["tags"][0])
+        self.assertNotIn("\r", self.track["tags"][1])
+        self.assertEqual(self.track["tags"][2], self.CR_TAG)
+
+    def test_direct_save_keeps_every_tag_original_bytes(self):
+        # 打开编辑页直接保存（所有框按浏览器的 CRLF 方式提交）：
+        # 三项换行原文逐字节保留，项数、顺序不变，标点项不变。
+        status, headers, page = self.save_form(self.INITIAL_TAGS)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_changing_only_title_keeps_tag_original_bytes(self):
+        status, _, page = self.save_form(
+            self.INITIAL_TAGS, title="换行写法曲目（改名）"
+        )
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], "换行写法曲目（改名）")
+        self.assertEqual(record["tags"], self.INITIAL_TAGS)
+
+    def test_reopen_page_renders_distinct_original_bytes(self):
+        # 保存后再次打开编辑页：三个换行写法不同的框仍是各自原文，
+        # 末尾保留一个空框。
+        self.save_form(self.INITIAL_TAGS)
+        page = self.get_edit_page(self.track_id)
+        self.assert_tag_boxes(page, self.INITIAL_TAGS + [""])
+
+    def test_repeated_saves_keep_newline_bytes_stable(self):
+        for round_index in range(2):
+            status, _, page = self.save_form(
+                self.INITIAL_TAGS, title=f"改名第 {round_index} 次"
+            )
+            self.assertEqual(status, 303, page[:500])
+            self.assertEqual(
+                self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+            )
+
+    def test_adding_only_surrounding_whitespace_keeps_original(self):
+        # 只给整项首尾增加空白（框内文字与内部空行没动）：保留原项原文。
+        tags = [
+            "  " + self.CRLF_TAG + "\t",
+            " " + self.LF_TAG + " ",
+            "\t" + self.CR_TAG + "  ",
+            " " + self.PUNCT_TAG,
+        ]
+        status, _, page = self.save_form(tags)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_delete_one_variant_keeps_other_variant_bytes(self):
+        # 任务示例：两项画面都是“自然/雨声”，一项 CRLF、一项 LF。
+        # 删掉其中一项，另一项必须保留自己的原文；两种排列都验证。
+        self.patch(self.track_id, {"tags": [self.CRLF_TAG, self.LF_TAG]})
+        status, _, page = self.save_form([self.CRLF_TAG])
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], [self.CRLF_TAG]
+        )
+
+        self.patch(self.track_id, {"tags": [self.LF_TAG, self.CRLF_TAG]})
+        status, _, page = self.save_form([self.LF_TAG])
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], [self.LF_TAG]
+        )
+
+    def test_delete_middle_item_keeps_newline_bytes_of_neighbours(self):
+        # [CRLF 项, 独立“雨声”项, LF 项]：删掉中间可区分的项，
+        # 两边标签的换行原文与相对顺序不变。
+        self.patch(self.track_id, {"tags": [
+            self.CRLF_TAG, "雨声", self.LF_TAG,
+        ]})
+        status, _, page = self.save_form([self.CRLF_TAG, self.LF_TAG])
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, self.LF_TAG],
+        )
+
+    def test_editing_one_box_lfifies_only_that_item(self):
+        # 只改第三项（原为单独 CR）：改动项按本次填写保存（LF），
+        # 其余未改项继续保留 CRLF/LF 原文。
+        new_text = "自然\n风声"
+        status, _, page = self.save_form(
+            [self.CRLF_TAG, self.LF_TAG, new_text, self.PUNCT_TAG]
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, self.LF_TAG, new_text, self.PUNCT_TAG],
+        )
+
+    def test_newline_variants_are_never_merged_by_saving(self):
+        # 即使两项在画面上看起来完全相同，只要最终保存的完整文字不同，
+        # 就不能只凭画面相同而合并：CRLF 原项保留，新改的项按 LF 保存。
+        self.patch(self.track_id, {"tags": [self.CRLF_TAG, "旧文字"]})
+        status, _, page = self.save_form([self.CRLF_TAG, self.LF_TAG])
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, self.LF_TAG],
+        )
+
+    def test_modified_identical_tags_still_deduped_by_final_text(self):
+        # 正常去重不受影响：把第二项改成与第一项完整文字相同（无换行歧义），
+        # 最终只保留第一次出现的一项。
+        self.patch(self.track_id, {"tags": ["前奏", "旧文字"]})
+        status, _, page = self.save_form(["前奏", "前奏"])
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], ["前奏"])
+
+    def test_failure_then_retry_keeps_unmodified_newline_bytes(self):
+        # 时长非法导致保存失败：记录保持原样，页面逐框回填本次填写
+        # （换行归一化为 LF）；只修正时长后再保存，未改标签仍保留
+        # 各自原来的换行写法，不会因经过错误页面丢项或改写原文。
+        submitted = [self.browser_text(text) for text in self.INITIAL_TAGS]
+        fields = self.edit_form_fields(
+            title="换行写法曲目",
+            source="/music/newlines.flac",
+            duration="-5",
+            description="清晨山涧录音",
+            tags=submitted,
+        )
+        status, _, failed_page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 回填的是本次填写：三项画面文字相同（LF 形态）+ 末尾空框。
+        self.assert_tag_boxes(
+            failed_page,
+            [self.LF_TAG, self.LF_TAG, self.LF_TAG, self.PUNCT_TAG, ""],
+        )
+
+        fields = self.edit_form_fields(
+            title="换行写法曲目",
+            source="/music/newlines.flac",
+            duration="240",
+            description="清晨山涧录音",
+            tags=submitted,
+        )
+        status, headers, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.track_id}&edited=1"
+        )
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 240)
+        self.assertEqual(record["tags"], self.INITIAL_TAGS)
+
+
 class EditPageDescriptionRenderTest(ServerTestCase):
     """打开编辑页：说明框完整还原原说明的空行、换行与首尾空格。"""
 
