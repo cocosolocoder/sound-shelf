@@ -23,6 +23,13 @@
   实际占用该来源的记录；冲突后任何记录都不被改动，可换来源直接重试。
 - 只有标识与名称、来源缺失的旧记录：省略来源可正常编辑且不参与判重；
   补填已被占用的来源同样适用拒绝保存规则。
+- 时长以秒为单位，允许未知、零和小数：改成零或有限的非负小数后，成功
+  响应与随后读取的列表一致；明确提交 null 才表示未知，零不是未知；未提交
+  时长时保留原值，其他未提交资料（含说明中的中文与换行）也不受影响。
+  负数、非有限数值、字符串（含数字文字）或布尔值一律 400 且 field 指向
+  duration，同一请求中的合法名称、说明也不写入，整条记录保持原样，与
+  原值是否已知无关；拒绝后用同一标识提交合法时长可正常保存，未重新提交
+  的资料保持编辑前的值。
 - 编辑页（GET/POST /tracks/{id}/edit）的标签每个标签项一个输入框：
   接口收录时按完整文字保存的标签（可含换行、中英文逗号、顿号）逐框展示，
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
@@ -1399,6 +1406,251 @@ class HomeCreateConflictTest(ServerTestCase):
         )
         self.assertEqual(status, 303, page[:500])
         self.assertEqual(len(self.list_tracks()), 4)
+
+
+class PatchDurationSuccessTest(ServerTestCase):
+    """PATCH 时长：零、非负小数与 null 成功保存，响应与列表读取一致。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首行说明\n第二行说明",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=9,
+        )
+
+    def assert_list_consistent(self, body):
+        """成功响应的完整记录与随后读取的列表一致：标识不变、不新增记录、
+        列表顺序不变，无关曲目不受影响。"""
+        self.assertEqual(body["id"], self.track_id)
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], [self.track_id, self.bystander["id"]]
+        )
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_set_zero_duration(self):
+        status, body = self.patch(self.track_id, {"duration": 0})
+        self.assertEqual(status, 200, body)
+        # 零是合法时长，不能被当成未知。
+        self.assertEqual(body["duration"], 0)
+        self.assertIsNotNone(body["duration"])
+        self.assert_list_consistent(body)
+        self.assertEqual(self.track_by_id(self.track_id)["duration"], 0)
+
+    def test_set_fractional_duration(self):
+        status, body = self.patch(self.track_id, {"duration": 300.25})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 300.25)
+        self.assert_list_consistent(body)
+
+    def test_set_integer_duration(self):
+        status, body = self.patch(self.track_id, {"duration": 300})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 300)
+        self.assert_list_consistent(body)
+
+    def test_zero_and_null_are_distinct(self):
+        # 先改成零：列表读到的应是 0 而不是未知。
+        status, body = self.patch(self.track_id, {"duration": 0})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.track_by_id(self.track_id)["duration"], 0)
+
+        # 明确提交 null 才把时长改成未知。
+        status, body = self.patch(self.track_id, {"duration": None})
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(body["duration"])
+        self.assertIsNone(self.track_by_id(self.track_id)["duration"])
+
+        # 再改回零：仍是 0，不会沿用未知。
+        status, body = self.patch(self.track_id, {"duration": 0})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.track_by_id(self.track_id)["duration"], 0)
+
+    def test_omitted_duration_keeps_old_value(self):
+        # 只改名称与说明、没有提交时长：保留原来的时长。
+        status, body = self.patch(self.track_id, {
+            "title": "夜航（改名）",
+            "description": "只改名称与说明",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 243.5)
+        self.assertEqual(self.track_by_id(self.track_id)["duration"], 243.5)
+
+    def test_other_fields_preserved_and_description_newlines_untouched(self):
+        # 只改时长：名称、来源、封面、标签与含中文换行的说明都保留原值。
+        status, body = self.patch(self.track_id, {"duration": 0})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航")
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["cover_url"], "https://img.example/yehang.png")
+        self.assertEqual(body["description"], "首行说明\n第二行说明")
+        self.assertEqual(body["tags"], ["民谣", "现场"])
+        self.assert_list_consistent(body)
+
+    def test_duration_and_metadata_saved_together(self):
+        # 同一次编辑提交时长与名称、说明：一起保存，
+        # 说明中的中文与换行不因调整时长受影响。
+        status, body = self.patch(self.track_id, {
+            "title": "夜航（重制）",
+            "duration": 250.5,
+            "description": "新的说明\n第二行：中文内容",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 250.5)
+        self.assertEqual(body["title"], "夜航（重制）")
+        self.assertEqual(body["description"], "新的说明\n第二行：中文内容")
+        self.assert_list_consistent(body)
+
+
+class PatchDurationValidationTest(ServerTestCase):
+    """PATCH 时长：非法值一律 400，field 指向 duration，整条记录保持原样。"""
+
+    # 负数、非有限数值、字符串（含数字文字）与布尔值都不是合法时长。
+    INVALID_DURATIONS = [
+        -1, -0.5,
+        float("inf"), float("-inf"), float("nan"),
+        "300", "0", "12.5", "", "三百",
+        True, False,
+        [0], {"seconds": 1},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        # 已有时长为已知与未知的记录各一条，拒绝规则对两者相同。
+        self.known = self.create_track(
+            title="已知时长",
+            source="/music/known.flac",
+            duration=243.5,
+            cover_url="https://img.example/known.png",
+            description="原始说明\n保留换行",
+            tags=["原始"],
+        )
+        self.unknown = self.create_track(
+            title="未知时长",
+            source="/music/unknown.flac",
+            description="未知时长的说明",
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=9,
+        )
+
+    def assert_nothing_changed(self):
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.known["id"], self.unknown["id"], self.bystander["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.known["id"]), self.known)
+        self.assertEqual(self.track_by_id(self.unknown["id"]), self.unknown)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_invalid_durations_rejected_regardless_of_old_value(self):
+        for bad in self.INVALID_DURATIONS:
+            for track in (self.known, self.unknown):
+                with self.subTest(bad=repr(bad), track=track["title"]):
+                    status, body = self.patch(track["id"], {"duration": bad})
+                    self.assertEqual(status, 400, body)
+                    self.assertEqual(body["field"], "duration")
+                    self.assertIn("时长", body["error"])
+        # 全部拒绝后，任何记录都没有被改动，也没有新增记录。
+        self.assert_nothing_changed()
+
+    def test_valid_metadata_in_same_request_is_not_saved(self):
+        # 同一次编辑还带着合法的新名称与新说明：时长不合法时这些内容
+        # 也不能先写入，目标曲目的完整资料仍与编辑前一致。
+        for track in (self.known, self.unknown):
+            status, body = self.patch(track["id"], {
+                "title": "不应保存的名称",
+                "description": "不应保存的说明\n第二行",
+                "duration": -5,
+            })
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["field"], "duration")
+            self.assertIn("时长", body["error"])
+        self.assert_nothing_changed()
+
+    def test_false_is_not_saved_as_zero(self):
+        # false 不能被当成数字零保存。
+        status, body = self.patch(self.known["id"], {"duration": False})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "duration")
+        self.assertEqual(self.track_by_id(self.known["id"])["duration"], 243.5)
+
+    def test_numeric_string_is_not_converted(self):
+        # 数字文字不能自动转换成数字保存。
+        status, body = self.patch(self.known["id"], {"duration": "300"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "duration")
+        self.assertEqual(self.track_by_id(self.known["id"])["duration"], 243.5)
+
+
+class PatchDurationRetryAfterRejectionTest(ServerTestCase):
+    """非法时长被拒绝后，用同一标识继续编辑：合法提交正常保存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            description="原始说明\n保留换行",
+            tags=["民谣"],
+        )
+        self.track_id = self.track["id"]
+
+    def reject_once(self):
+        """提交一次带合法名称、说明但时长非法的编辑，确认被拒绝且未写入。"""
+        status, body = self.patch(self.track_id, {
+            "title": "失败请求里的名称",
+            "description": "失败请求里的说明",
+            "duration": -5,
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "duration")
+        # 失败请求没有写入任何内容。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+    def test_retry_with_only_duration_keeps_pre_edit_metadata(self):
+        self.reject_once()
+        # 只提交合法时长，没有重新提交上次尝试修改的名称与说明：
+        # 这些资料保持编辑前的值，不能从失败请求中补入。
+        status, body = self.patch(self.track_id, {"duration": 300})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 300)
+        self.assertEqual(body["title"], "夜航")
+        self.assertEqual(body["description"], "原始说明\n保留换行")
+        self.assertEqual(body["tags"], ["民谣"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(len(self.list_tracks()), 1)
+
+    def test_retry_with_duration_and_new_metadata_saves_all(self):
+        self.reject_once()
+        # 本次明确提交了合法的新资料，与时长一起保存本次内容。
+        status, body = self.patch(self.track_id, {
+            "title": "修正后的名称",
+            "description": "修正后的说明\n第二行",
+            "duration": 0,
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "修正后的名称",
+            "source": "/music/yehang.flac",
+            "duration": 0,
+            "cover_url": "",
+            "description": "修正后的说明\n第二行",
+            "tags": ["民谣"],
+        })
+        self.assertEqual(self.track_by_id(self.track_id), body)
 
 
 if __name__ == "__main__":
