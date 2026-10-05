@@ -55,6 +55,23 @@
 - 一次非法时长编辑被拒后，用同一标识提交合法时长可正常保存；本次只
   提交时长时，失败请求里尝试修改的名称、说明不会被补入，本次明确提交
   的合法新资料则与时长一起保存。
+- 标签（PATCH tags）：提交即以本次标签整体替换旧标签，绝不追加到旧标签
+  后面；成功返回 200 和修改后的完整曲目，随后列表读到同样的标签文字与
+  先后。每个数组项是一个完整标签：只去掉各项首尾空白、忽略空项，仅
+  完整文字相同时才按首次出现位置去重；中文、项内空行、中英文逗号和
+  顿号都是标签文字的一部分，不按行或标点拆分。多行标签与只写其中一行
+  的另一项仍是两项；仅内部换行写法不同（LF 对 CRLF）的两项也不合并，
+  保存后各自保留提交的换行写法。只改名称或说明、省略 tags 时原标签的
+  内容与顺序保持不变；明确提交空数组或 null 则清空标签，不能把清空当成
+  未修改；只提交标签时名称、来源、时长、封面、说明保持原样。同一来源
+  有多个独立版本时，编辑其中一条的标签成功且不触发来源冲突，其他版本
+  的标签与资料不受影响。
+- 非法标签使整次编辑失败：tags 传字符串或对象、数组里混入数字、布尔值、
+  null 等非字符串项时返回 400，field 指向 tags，错误文字说明标签有误；
+  整个 tags 为 null 是合法清空，必须与数组中的 null 区别对待。即使错误
+  项前已有合法标签，或同次请求还提交了合法的新名称、新说明，也不保存
+  部分内容；失败后列表中目标曲目的完整资料仍与提交前一致，其他曲目、
+  记录数量与列表顺序都不变。
 - 编辑页（GET/POST /tracks/{id}/edit）的标签每个标签项一个输入框：
   接口收录时按完整文字保存的标签（可含换行、中英文逗号、顿号）逐框展示，
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
@@ -1211,6 +1228,392 @@ class EditDurationRetryAfterRejectionTest(ServerTestCase):
         self.assertEqual(body["title"], "山涧晨曲")
         self.assertEqual(body["description"], "原始说明\n保留换行")
         self.assertIsNone(self.track_by_id(self.track_id)["duration"])
+
+
+class PatchTagsReplaceTest(ServerTestCase):
+    """PATCH tags：本次提交整体替换旧标签，200 返回完整记录，列表一致。"""
+
+    INITIAL_TAGS = ["旧标签·甲", "旧标签·乙", "旧标签·丙"]
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="清晨山涧录音\n第二行：鸟鸣",
+            tags=list(self.INITIAL_TAGS),
+        )
+        self.track_id = self.track["id"]
+        # 另一首曲目用于核对记录数量与列表顺序不变。
+        self.after = self.create_track(
+            title="排在后面的曲目", source="/music/after.flac", duration=8,
+        )
+
+    def expected_record(self, tags):
+        record = dict(self.track)
+        record["tags"] = tags
+        return record
+
+    def test_submitted_tags_replace_old_tags_instead_of_appending(self):
+        # 与旧标签完全不重叠的一组：旧标签一个都不能留下，新标签也不能
+        # 被追加到旧标签后面。
+        new_tags = ["民谣", "现场", "2026 现场版"]
+        status, body = self.patch(self.track_id, {"tags": new_tags})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], new_tags)
+        # 成功响应是修改后的完整曲目，标签之外的资料原样。
+        self.assertEqual(body, self.expected_record(new_tags))
+        # 随后读取曲目列表得到相同的标签文字与顺序。
+        self.assertEqual(self.track_by_id(self.track_id), body)
+
+    def test_overlapping_tags_still_replace_entire_set_without_reordering(self):
+        # 新旧标签有重叠也仍然整体替换：只保留本次提交的文字与先后，
+        # 没有被保留的旧标签消失，顺序按本次提交而非旧顺序。
+        new_tags = ["旧标签·丙", "全新标签", "旧标签·甲"]
+        status, body = self.patch(self.track_id, {"tags": new_tags})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], new_tags)
+        self.assertNotIn("旧标签·乙", body["tags"])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], new_tags)
+
+    def test_replacing_keeps_same_id_and_does_not_create_records(self):
+        before_ids = [t["id"] for t in self.list_tracks()]
+        status, body = self.patch(self.track_id, {"tags": ["唯一标签"]})
+        self.assertEqual(status, 200, body)
+        # 修改的是原有记录，标识不变。
+        self.assertEqual(body["id"], self.track_id)
+        # 不新增曲目，列表顺序仍是标识升序。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], before_ids
+        )
+        self.assertEqual(self.track_by_id(self.after["id"]), self.after)
+
+    def test_changing_title_without_tags_keeps_tags_content_and_order(self):
+        status, body = self.patch(self.track_id, {"title": "山涧晨曲（改名）"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "山涧晨曲（改名）")
+        self.assertEqual(body["tags"], self.INITIAL_TAGS)
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_changing_description_without_tags_keeps_tags_content_and_order(self):
+        new_description = "新的说明\n第二行中文，保留逗号、顿号"
+        status, body = self.patch(self.track_id, {"description": new_description})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], new_description)
+        self.assertEqual(body["tags"], self.INITIAL_TAGS)
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_empty_array_explicitly_clears_tags(self):
+        status, body = self.patch(self.track_id, {"tags": []})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], [])
+
+        # 清空是真实写入：之后只改名称、省略 tags，标签仍然为空，
+        # 不能把清空误当成“未修改”而恢复旧标签。
+        status, body = self.patch(self.track_id, {"title": "清空后改名"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "清空后改名")
+        self.assertEqual(body["tags"], [])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], [])
+
+    def test_null_explicitly_clears_tags(self):
+        status, body = self.patch(self.track_id, {"tags": None})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], [])
+
+    def test_tags_only_keeps_all_other_metadata(self):
+        # 只提交标签时，名称、来源、时长、封面、说明全部保持原样。
+        status, body = self.patch(self.track_id, {"tags": ["只动标签"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "山涧晨曲",
+            "source": "/music/shanjian.flac",
+            "duration": 212,
+            "cover_url": "https://img.example/shanjian.png",
+            "description": "清晨山涧录音\n第二行：鸟鸣",
+            "tags": ["只动标签"],
+        })
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(self.track_by_id(self.after["id"]), self.after)
+
+
+class PatchTagsNormalizationTest(ServerTestCase):
+    """PATCH tags 逐项规整：裁剪首尾空白、忽略空项、完整文字去重保序。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="林间录音", source="/music/linjian.flac", duration=100,
+        )
+        self.track_id = self.track["id"]
+
+    def test_trim_blank_items_and_dedup_keep_first_position(self):
+        status, body = self.patch(self.track_id, {"tags": [
+            "  民谣 ",          # 去首尾空白后保存
+            "",                 # 空项忽略
+            " \t\n\r ",         # 只有空白，忽略
+            "现场",
+            "民谣",             # 与首项完整文字相同，去重
+            " 现场 ",           # 裁剪后相同，去重，不新增
+            "新编",
+        ]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], ["民谣", "现场", "新编"])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], ["民谣", "现场", "新编"]
+        )
+
+    def test_multiline_tag_and_its_single_line_remain_two_items(self):
+        # 一个多行标签与只写其中一行的另一个标签仍是两项。
+        multiline = "自然\n雨声"
+        status, body = self.patch(self.track_id, {"tags": [multiline, "雨声"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [multiline, "雨声"])
+        self.assertEqual(len(body["tags"]), 2)
+
+    def test_internal_blank_lines_are_part_of_tag_text(self):
+        # 项内空行属于标签文字：不按行拆分，整项作为一个标签保存。
+        tag = "第一段\n\n\n第三段"
+        status, body = self.patch(self.track_id, {"tags": [tag]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [tag])
+        self.assertEqual(len(body["tags"]), 1)
+
+    def test_chinese_and_punctuation_are_part_of_tag_text(self):
+        # 中文、中英文逗号、顿号都是标签文字，原样保存，绝不按标点拆分。
+        tags = [
+            "前奏，间奏、尾奏",
+            "前奏,间奏,尾奏",
+            "一行写两样：风，雨、雷",
+            "中文标签",
+        ]
+        status, body = self.patch(self.track_id, {"tags": tags})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], tags)
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], tags)
+
+    def test_lf_crlf_and_cr_newline_variants_are_distinct_tags(self):
+        # 仅内部换行写法不同的两项不能被合并：接口保存后各自保留提交的
+        # LF、CRLF 与 CR 换行写法。
+        lf_tag = "自然\n雨声"
+        crlf_tag = "自然\r\n雨声"
+        cr_tag = "自然\r雨声"
+        status, body = self.patch(self.track_id, {
+            "tags": [lf_tag, crlf_tag, cr_tag],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [lf_tag, crlf_tag, cr_tag])
+        stored = self.track_by_id(self.track_id)["tags"]
+        self.assertEqual(stored, [lf_tag, crlf_tag, cr_tag])
+        self.assertNotIn("\r", stored[0])
+        self.assertIn("\r\n", stored[1])
+        self.assertIn("\r", stored[2])
+        self.assertNotIn("\r\n", stored[2])
+
+    def test_multiline_and_single_lines_distinct_even_with_surrounding_space(self):
+        # 多行项即使首尾带空白也只裁剪首尾；它与“自然”“雨声”两个单行项
+        # 完整文字不同，三项各自保留。
+        status, body = self.patch(self.track_id, {
+            "tags": ["  自然\n雨声\t", "自然", "雨声"],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], ["自然\n雨声", "自然", "雨声"])
+
+
+class PatchTagsSameSourceVersionsTest(ServerTestCase):
+    """同一来源有多个独立版本：编辑一条标签不触发来源冲突，其他版本不动。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            cover_url="https://img.example/yehang-remaster.png",
+            description="重制说明",
+            tags=["民谣", "重制"],
+            save_as_new_version=True,
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+        )
+
+    def test_edit_tags_of_one_version_succeeds_without_source_conflict(self):
+        status, body = self.patch(self.second["id"], {
+            "tags": ["重制", "2026", "现场版"],
+        })
+        self.assertEqual(status, 200, body)
+        # 来源未改动不能触发重复来源冲突。
+        self.assertNotIn("existing", body)
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["tags"], ["重制", "2026", "现场版"])
+
+        # 记录数量不增加，顺序不变。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.first["id"], self.second["id"], self.bystander["id"]],
+        )
+        # 其他版本的标签与全部资料不受影响，没有被合并或覆盖。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+        # 被编辑版本除标签外的资料保持原样。
+        edited = self.track_by_id(self.second["id"])
+        self.assertEqual(edited["title"], "夜航·重制")
+        self.assertEqual(edited["duration"], 250)
+        self.assertEqual(
+            edited["cover_url"], "https://img.example/yehang-remaster.png"
+        )
+        self.assertEqual(edited["description"], "重制说明")
+        self.assertEqual(edited["tags"], ["重制", "2026", "现场版"])
+
+    def test_edit_tags_with_same_source_resubmitted_still_succeeds(self):
+        # 同时显式提交与当前相同（仅首尾空白不同）的来源文字也不判重。
+        status, body = self.patch(self.first["id"], {
+            "source": "  /music/yehang.flac  ",
+            "tags": ["现场", "首版"],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["tags"], ["现场", "首版"])
+        # 同一来源的另一版本仍保持原样。
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+
+class PatchTagsInvalidTest(ServerTestCase):
+    """非法标签使整次编辑失败：400、field=tags，整条记录与其他曲目不变。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="清晨山涧录音\n第二行：鸟鸣",
+            tags=["旧标签·甲", "旧标签·乙"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=33.3,
+            description="不应受影响", tags=["旁观"],
+        )
+
+    def assert_tags_rejected(self, bad_tags, *, with_metadata=False):
+        """非法标签（可同时夹带合法的新名称、新说明）必须整单失败。"""
+        payload = {"tags": bad_tags}
+        if with_metadata:
+            payload["title"] = "不应保存的新名称"
+            payload["description"] = "不应保存的新说明\n第二行"
+        status, body = self.patch(self.track_id, payload)
+        self.assertEqual(status, 400, body)
+        # field 指向 tags，错误文字说明标签有误。
+        self.assertEqual(body["field"], "tags")
+        self.assertIn("标签", body["error"])
+        # 绝不是来源重复冲突的响应。
+        self.assertNotIn("existing", body)
+
+    def assert_everything_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量与列表顺序不变。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.bystander["id"]],
+        )
+        # 目标曲目的完整资料仍与提交前一致：标签与同次提交的名称、
+        # 说明都没有被部分写入。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 其他曲目不受影响。
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_tags_as_string_is_rejected(self):
+        # 字符串既不能当成一个标签，也不能按其中的逗号或换行拆成多项。
+        for bad in ("民谣,现场", "民谣", "", "民谣\n现场", " 民谣 "):
+            with self.subTest(bad=repr(bad)):
+                self.assert_tags_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_tags_as_object_is_rejected(self):
+        for bad in ({}, {"0": "民谣"}, {"tags": ["民谣"]}):
+            with self.subTest(bad=bad):
+                self.assert_tags_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_non_string_items_are_rejected(self):
+        # 数字、布尔值、null、对象、数组等非字符串项都不合法。
+        for bad in ([1], [243.5], [True], [False], [None], [{}], [["民谣"]]):
+            with self.subTest(bad=repr(bad)):
+                self.assert_tags_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_bad_item_after_valid_items_does_not_save_partial_tags(self):
+        # 即使错误项前面已有合法标签，也不能先保存合法部分。
+        self.assert_tags_rejected(["合法标签", "另一个合法标签", 3])
+        self.assert_everything_unchanged()
+
+    def test_bad_item_before_valid_items_is_also_atomic(self):
+        self.assert_tags_rejected([0, "合法标签"])
+        self.assert_everything_unchanged()
+
+    def test_valid_new_metadata_with_bad_tags_is_not_saved(self):
+        # 同次请求还提交了合法的新名称、新说明，也不能保存部分内容。
+        self.assert_tags_rejected(["合法标签", None], with_metadata=True)
+        self.assert_everything_unchanged()
+
+    def test_null_item_is_rejected_but_whole_tags_null_clears(self):
+        # 数组中的 null 是非法标签项……
+        status, body = self.patch(self.track_id, {"tags": [None]})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "tags")
+        self.assertIn("标签", body["error"])
+        self.assert_everything_unchanged()
+
+        # ……而整个 tags 为 null 是合法清空，二者必须区别对待。
+        status, body = self.patch(self.track_id, {"tags": None})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["tags"], [])
+        self.assertEqual(self.track_by_id(self.track_id)["tags"], [])
+
+    def test_legal_retry_after_bad_tags_saves_without_leaked_metadata(self):
+        # 非法标签被拒后，用同一标识提交合法标签可正常保存；失败请求里
+        # 夹带的名称、说明不会补入，本次只改标签，其他资料保持编辑前的值。
+        status, body = self.patch(self.track_id, {
+            "title": "失败请求里的新名称",
+            "description": "失败请求里的新说明",
+            "tags": ["合法标签", False],
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "tags")
+
+        status, body = self.patch(self.track_id, {"tags": ["重制"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "山涧晨曲",
+            "source": "/music/shanjian.flac",
+            "duration": 212,
+            "cover_url": "https://img.example/shanjian.png",
+            "description": "清晨山涧录音\n第二行：鸟鸣",
+            "tags": ["重制"],
+        })
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
 
 
 class EditPageDurationBackfillTest(ServerTestCase):
