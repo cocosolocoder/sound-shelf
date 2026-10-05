@@ -15,6 +15,24 @@
 - 只有标识与名称、来源缺失的旧记录不参加重复判断，不会因名称相同
   拦住新收录；save_as_new_version 只接受布尔值，字符串或数字返回 400
   并指出该字段，既不能当作同意另存，也不会写入任何新曲目。
+- 必填资料校验（名称 title 与来源 source）：两项都必须是字符串，去掉
+  首尾空白后不能为空。JSON 收录接口分别省略其中一项、提交 null、空串、
+  只有空白的字符串，或把其中一项写成数字、布尔值、数组、对象时返回
+  400，field 指向对应字段，错误文字说明名称或来源不合法；每次只让一个
+  必填字段出错，另一项与全部选填资料即使都合法，也不能产生一条不完整
+  的曲目，记录数量不增加。用例来源都使用尚未收录的文字，失败属于必填
+  资料错误而不是来源重复冲突。对照：中文名称与含中文路径的来源可以
+  收录，只有首尾空白被去掉，内部文字与标点原样保留；成功返回 201，
+  响应记录与随后列表读到的记录一致；省略选填资料仍按时长未知、封面和
+  说明为空、标签为空数组保存。
+- 首页手动收录表单的名称或来源留空、只填空白时返回 400：页面显示
+  失败提示，并在对应字段附近指出错误；回填保留本次填写的名称、来源、
+  时长、封面、说明、标签及另存选择，不能用已有记录的资料替换；说明里
+  的中文、换行和看起来像网页标签的内容仍按普通文字显示。用户只修正
+  出错的必填项、保留错误页中的其他填写再保存，应新增一条采用本次完整
+  资料的曲目，失败前填写的选填内容不能丢掉。错误提交前已有的曲目保留
+  完整资料和列表顺序，记录数量不增加；空曲库中的失败提交也仍显示没有
+  记录。
 
 编辑（PATCH /api/tracks/{id} 与 /tracks/{id}/edit 表单）：
 - 同一来源允许另存多个独立版本；编辑其中一条时，它自己不构成冲突，
@@ -507,6 +525,26 @@ class ServerTestCase(unittest.TestCase):
         return self.server.post_form(
             "/", fields, follow_redirects=follow_redirects,
         )
+
+    def create_fields_from_rendered_page(self, page):
+        """按首页收录表单当前回填内容重建一份可提交字段（含另存勾选）。
+
+        模拟用户在失败重绘的页面上保留已填内容、只修正出错字段后再次
+        保存：普通输入框取回填值，说明框取浏览器实际呈现的文字，
+        勾选框按当前选中状态还原。
+        """
+        fields = [
+            ("title", parse_input_value(page, "title", "title")),
+            ("source", parse_input_value(page, "source", "source")),
+            ("duration", parse_input_value(page, "duration", "duration")),
+            ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
+            ("description", parse_description_box(page)),
+            ("tags", parse_input_value(page, "tags", "tags")),
+        ]
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        if checkbox is not None and "checked" in checkbox.group(0):
+            fields.append(("save_as_new_version", "1"))
+        return fields
 
 
 
@@ -3268,6 +3306,553 @@ class HomeCreateConflictTest(ServerTestCase):
         )
         self.assertEqual(status, 303, page[:500])
         self.assertEqual(len(self.list_tracks()), 4)
+
+
+class CreateRequiredFieldApiTest(ServerTestCase):
+    """收录接口：名称/来源缺失或不合法时 400 且不产生不完整记录。
+
+    所有用例的来源都使用尚未收录的文字，使失败明确属于必填资料错误，
+    而不是来源重复冲突（409）。
+    """
+
+    # 与出错必填项一起提交的选填资料全部合法：即使如此也整单不写入。
+    OPTIONAL_FIELDS = {
+        "duration": 243.5,
+        "cover_url": "https://img.example/candidate.png",
+        "description": "候选说明：中文、换行\n第二行",
+        "tags": ["候选", "新编"],
+    }
+    VALID_TITLE = "山涧晨曲"
+    # 每次按用例名派生未收录来源，避免任何子例之间发生来源重复。
+    SOURCE_COUNTER = 0
+
+    def bad_payload(self, field, bad_value, *, with_optional):
+        payload = {"title": self.VALID_TITLE, "source": self.free_source()}
+        payload[field] = bad_value
+        if with_optional:
+            payload.update(self.OPTIONAL_FIELDS)
+        return payload
+
+    def free_source(self):
+        CreateRequiredFieldApiTest.SOURCE_COUNTER += 1
+        return f"/music/required-{CreateRequiredFieldApiTest.SOURCE_COUNTER}.flac"
+
+    def assert_required_error(self, status, body, field, label):
+        self.assertEqual(status, 400, body)
+        # field 指向出错的那个必填字段。
+        self.assertEqual(body["field"], field)
+        # 错误文字说明该字段不合法（含其中文名称）。
+        self.assertIn(label, body["error"])
+        # 绝不是来源重复冲突的响应。
+        self.assertNotIn("existing", body)
+
+    def assert_nothing_saved(self):
+        # 失败不能产生一条不完整的曲目。
+        self.assertEqual(self.list_tracks(), [])
+
+    def assert_cases_for_field(self, field, label, bad_values):
+        for bad in bad_values:
+            with self.subTest(field=field, bad=repr(bad)):
+                payload = self.bad_payload(field, bad, with_optional=True)
+                status, body = self.server.request(
+                    "POST", "/api/tracks", payload
+                )
+                self.assert_required_error(status, body, field, label)
+                self.assert_nothing_saved()
+
+    def test_title_missing_null_blank_and_non_strings_are_rejected(self):
+        # 省略名称、null、空字符串、只有空白的字符串，以及数字、布尔值、
+        # 数组、对象：另一项（来源）与全部选填资料合法也不能写入。
+        bad_values = [None, "", " ", "\t", " \n\t\r ",
+                      0, 1, 243.5, False, True, [], ["名称"], {}, {"a": 1}]
+        self.assert_cases_for_field("title", "名称", bad_values)
+
+    def test_source_missing_null_blank_and_non_strings_are_rejected(self):
+        bad_values = [None, "", " ", "\t", "  \t\n ",
+                      0, 3, 243.5, False, True, [], ["/x"], {}, {"a": 1}]
+        self.assert_cases_for_field("source", "来源", bad_values)
+
+    def test_omitted_field_omits_the_key_entirely(self):
+        # “省略”必须是请求里根本没有该键，而不是提交 null；两种形态都拒绝。
+        for field, label in (("title", "名称"), ("source", "来源")):
+            with self.subTest(field=field):
+                payload = {"title": self.VALID_TITLE, "source": self.free_source()}
+                del payload[field]
+                status, body = self.server.request(
+                    "POST", "/api/tracks", payload
+                )
+                self.assert_required_error(status, body, field, label)
+                self.assert_nothing_saved()
+
+    def test_optional_only_payloads_with_one_bad_required_are_atomic(self):
+        # 每次只让一个必填字段出错；合法的另一项与选填资料不先写入。
+        # 这里覆盖“出错字段给字符串类型但为空白”与“类型错误”两类，
+        # 并显式断言数据库没有新增记录。
+        cases = [
+            ("title", "   "), ("title", 123), ("title", True),
+            ("title", []), ("title", {}),
+            ("source", "\t\n"), ("source", 456), ("source", False),
+            ("source", []), ("source", {}),
+        ]
+        for field, bad in cases:
+            with self.subTest(field=field, bad=repr(bad)):
+                payload = self.bad_payload(field, bad, with_optional=True)
+                status, body = self.server.request(
+                    "POST", "/api/tracks", payload
+                )
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], field)
+                self.assert_nothing_saved()
+
+    def test_chinese_title_and_source_with_chinese_path_are_saved(self):
+        # 有效收录对照：中文名称、含中文目录的来源可以保存；首尾空白被
+        # 去掉，内部文字与标点（含连续空格）原样保留。
+        payload = {
+            "title": "  夜航·前奏（live）  ",
+            "source": "\t/音乐/现场 录音/夜航 序曲.flac\n",
+        }
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["title"], "夜航·前奏（live）")
+        self.assertEqual(body["source"], "/音乐/现场 录音/夜航 序曲.flac")
+        # 省略选填资料仍按既有默认结果保存：时长未知、封面和说明为空、
+        # 标签为空数组。
+        self.assertIsNone(body["duration"])
+        self.assertEqual(body["cover_url"], "")
+        self.assertEqual(body["description"], "")
+        self.assertEqual(body["tags"], [])
+        # 成功响应与随后列表读到的记录一致。
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0], body)
+
+    def test_valid_create_with_all_optional_fields_round_trips(self):
+        # 第二个对照：选填资料齐全的有效收录同样成功，防止上面的拒绝
+        # 用例把合法资料也误伤。
+        payload = {
+            "title": "晨曲",
+            "source": self.free_source(),
+            **self.OPTIONAL_FIELDS,
+        }
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(self.track_by_id(body["id"]), body)
+        self.assertEqual(len(self.list_tracks()), 1)
+
+
+class CreateRequiredFieldApiWithExistingTest(ServerTestCase):
+    """已有曲库时必填资料失败：已有记录完整保留，顺序与数量不变。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="已有曲目·甲",
+            source="/music/existing-a.flac",
+            duration=12,
+            cover_url="https://img.example/a.png",
+            description="甲的说明\n第二行",
+            tags=["民谣", "现场"],
+        )
+        self.second = self.create_track(
+            title="已有曲目·乙",
+            source="/music/existing-b.flac",
+            duration=None,
+            description="",
+            tags=[],
+        )
+        self.expected_ids = [self.first["id"], self.second["id"]]
+
+    def assert_library_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量不增加，列表顺序不变，已有记录完整资料不被改动。
+        self.assertEqual([t["id"] for t in tracks], self.expected_ids)
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+    def test_bad_title_requests_leave_library_untouched(self):
+        for bad in (None, "", "  \t ", 7, True, [], {}):
+            with self.subTest(bad=repr(bad)):
+                payload = {
+                    "title": bad,
+                    "source": "/music/fresh-title-case.flac",
+                    "duration": 99,
+                    "description": "不应保存的说明",
+                    "tags": ["不应保存"],
+                }
+                status, body = self.server.request(
+                    "POST", "/api/tracks", payload
+                )
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "title")
+                self.assertIn("名称", body["error"])
+                self.assert_library_unchanged()
+
+    def test_bad_source_requests_leave_library_untouched(self):
+        for bad in (None, "", "\n\t ", 7, False, [], {}):
+            with self.subTest(bad=repr(bad)):
+                payload = {
+                    "title": "候选名称",
+                    "source": bad,
+                    "duration": 99,
+                    "cover_url": "https://img.example/new.png",
+                    "description": "不应保存的说明",
+                    "tags": ["候选"],
+                }
+                status, body = self.server.request(
+                    "POST", "/api/tracks", payload
+                )
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "source")
+                self.assertIn("来源", body["error"])
+                self.assert_library_unchanged()
+
+    def test_valid_create_after_failures_extends_library(self):
+        # 多次必填失败后，一次有效收录仍能成功，接在已有记录之后。
+        for bad in ("", "   "):
+            status, _ = self.server.request("POST", "/api/tracks", {
+                "title": bad, "source": "/music/never-written.flac",
+            })
+            self.assertEqual(status, 400)
+        self.assert_library_unchanged()
+
+        status, body = self.server.request("POST", "/api/tracks", {
+            "title": "补收录的曲目", "source": "/music/after-failures.flac",
+        })
+        self.assertEqual(status, 201, body)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            self.expected_ids + [body["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+
+class HomeCreateRequiredFieldEmptyLibraryTest(ServerTestCase):
+    """空曲库时首页收录表单必填失败：400 回填，仍显示没有记录。"""
+
+    def assert_error_for_field(self, page, field, label):
+        # 顶部失败提示。
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner, "页面应显示失败提示")
+        self.assertIn(label, strip_tags(banner.group(1)))
+        # 对应字段附近指出错误。
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(
+            any(label in text for text in field_errors),
+            f"{label}字段附近应显示错误，实际：{field_errors}",
+        )
+
+    def assert_still_empty_library(self, page):
+        # 记录数量不增加；空曲库仍显示没有记录，而不是出现列表。
+        self.assertEqual(self.list_tracks(), [])
+        self.assertIsNone(TRACK_LIST_RE.search(page))
+        self.assertIn("还没有曲目记录", page)
+
+    def test_blank_title_or_source_returns_400_and_reprints(self):
+        for field, label, typed in (
+            ("title", "名称", ""),
+            ("title", "名称", "   "),
+            ("title", "名称", "\t\n "),
+            ("source", "来源", ""),
+            ("source", "来源", "  \t"),
+        ):
+            with self.subTest(field=field, typed=repr(typed)):
+                status, _, page = self.post_create_form(
+                    self.create_form_fields(
+                        title=typed if field == "title" else "山涧晨曲",
+                        source=typed if field == "source" else "/音乐/现场.flac",
+                    )
+                )
+                self.assertEqual(status, 400, page[:500])
+                self.assert_error_for_field(page, field, label)
+                self.assert_still_empty_library(page)
+
+    def test_failed_submission_reprints_every_filled_field(self):
+        # 名称只填空白导致失败；来源、时长、封面、说明、标签与另存选择
+        # 都必须按本次填写回填，不能用任何已有记录的资料替换（此时也
+        # 根本没有已有记录）。
+        description = "中文说明\n第二行 <img src=x> 看起来像标签\n结尾"
+        fields = self.create_form_fields(
+            title=" \t ",
+            source="/音乐/现场 录音/夜航.flac",
+            duration="243.5",
+            cover_url="https://img.example/cover.png",
+            description=description,
+            tags="民谣,现场，新编、自留",
+            save_as_new_version=True,
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assert_error_for_field(page, "title", "名称")
+
+        self.assert_form_values(
+            page,
+            title=" \t ",
+            source="/音乐/现场 录音/夜航.flac",
+            duration="243.5",
+            cover_url="https://img.example/cover.png",
+            description=description,
+        )
+        self.assertEqual(
+            parse_input_value(page, "tags", "tags"), "民谣,现场，新编、自留"
+        )
+        # 另存选择保留为勾选。
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        self.assertIsNotNone(checkbox)
+        self.assertIn("checked", checkbox.group(0))
+        self.assert_still_empty_library(page)
+
+    def test_failed_submission_without_checkbox_keeps_it_unchecked(self):
+        # 来源空白导致失败且未勾选另存：回填页不得偷偷选中勾选框。
+        fields = self.create_form_fields(
+            title="山涧晨曲",
+            source="   ",
+            duration="12",
+            description="说明",
+            tags="标签",
+            save_as_new_version=False,
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assert_error_for_field(page, "source", "来源")
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        self.assertIsNotNone(checkbox)
+        self.assertNotIn("checked", checkbox.group(0))
+        # 来源框回填本次填写的空白。
+        self.assert_form_values(page, source="   ", title="山涧晨曲")
+        self.assert_still_empty_library(page)
+
+    def test_description_html_looking_text_is_escaped_in_reprint(self):
+        # 说明中的中文、换行与看起来像网页标签的内容在回填时按普通文字
+        # 转义显示，不会变成页面元素；框内呈现仍是原文。
+        description = (
+            "中文“引号”\n<尖括号> 与 <b>看起来像标签</b>\n"
+            "</textarea><script>alert(1)</script>"
+        )
+        fields = self.create_form_fields(
+            title="", source="/music/desc.flac", description=description,
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(parse_description_box(page), description)
+        markup = description_box_markup(page)
+        self.assertNotIn("<script>", markup)
+        self.assertNotIn("<b>", markup)
+        self.assertIn("&lt;b&gt;", markup)
+        self.assertIn("&lt;/textarea&gt;", markup)
+
+
+class HomeCreateRequiredFieldWithExistingTest(ServerTestCase):
+    """已有曲目时首页必填失败：已有记录完整保留；修正后新增完整曲目。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="已有曲目·甲",
+            source="/music/existing-a.flac",
+            duration=12,
+            cover_url="https://img.example/a.png",
+            description="甲的说明\n第二行",
+            tags=["民谣"],
+        )
+        self.second = self.create_track(
+            title="已有曲目·乙", source="/music/existing-b.flac",
+        )
+        self.expected_ids = [self.first["id"], self.second["id"]]
+
+    def assert_library_unchanged(self):
+        tracks = self.list_tracks()
+        self.assertEqual([t["id"] for t in tracks], self.expected_ids)
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+    def assert_field_error(self, page, label):
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner)
+        self.assertIn(label, strip_tags(banner.group(1)))
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(any(label in text for text in field_errors))
+
+    def test_blank_required_fields_keep_existing_records_intact(self):
+        for field, typed in (
+            ("title", ""), ("title", "  \t "),
+            ("source", ""), ("source", "\n\t"),
+        ):
+            with self.subTest(field=field, typed=repr(typed)):
+                status, _, page = self.post_create_form(
+                    self.create_form_fields(
+                        title=typed if field == "title" else "候选名称",
+                        source=typed if field == "source"
+                        else "/音乐/新来源.flac",
+                        duration="307.25",
+                        cover_url="https://img.example/new.png",
+                        description="候选说明\n换行",
+                        tags="候选,新编",
+                    )
+                )
+                self.assertEqual(status, 400, page[:500])
+                self.assert_field_error(page, "名称" if field == "title" else "来源")
+                # 已有曲目完整资料与列表顺序不变，数量不增加。
+                self.assert_library_unchanged()
+                # 列表区仍只列出提交前的两条已有记录。
+                self.assertEqual(
+                    parse_listed_tracks(page),
+                    [(self.first["id"], "已有曲目·甲"),
+                     (self.second["id"], "已有曲目·乙")],
+                )
+
+    def test_reprint_uses_submission_not_existing_record_data(self):
+        # 失败回填必须保留本次填写，不能用已有记录（甲）的资料替换：
+        # 名称、来源、时长、封面、说明、标签、另存选择都与甲不同。
+        description = "本次填写：中文\n<img src=x> 不是标签\n  结尾两空格"
+        fields = self.create_form_fields(
+            title="",  # 名称留空导致失败
+            source="/音乐/候选/录音.flac",
+            duration="307.25",
+            cover_url="https://img.example/candidate.png",
+            description=description,
+            tags="候选,新编",
+            save_as_new_version=True,
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assert_field_error(page, "名称")
+
+        self.assert_form_values(
+            page,
+            title="",
+            source="/音乐/候选/录音.flac",
+            duration="307.25",
+            cover_url="https://img.example/candidate.png",
+            description=description,
+        )
+        self.assertEqual(parse_input_value(page, "tags", "tags"), "候选,新编")
+        checkbox = FORCE_CHECKBOX_RE.search(page)
+        self.assertIn("checked", checkbox.group(0))
+        self.assert_library_unchanged()
+        # 回填说明里看起来像标签的文字被转义，按普通文字显示。
+        self.assertIn("&lt;img src=x&gt;", description_box_markup(page))
+
+    def test_fix_only_bad_title_saves_complete_new_record(self):
+        # 第一次：名称空白导致失败，其余资料（含另存勾选）完整填写。
+        description = "失败前填写的说明：中文\n第二行换行\n"
+        failed_fields = self.create_form_fields(
+            title="   ",
+            source="/音乐/修正后保存.flac",
+            duration="307.25",
+            cover_url="https://img.example/candidate.png",
+            description=description,
+            tags="候选,新编,候选",
+            save_as_new_version=True,
+        )
+        status, _, failed_page = self.post_create_form(failed_fields)
+        self.assertEqual(status, 400)
+        self.assert_library_unchanged()
+
+        # 用户只修正出错的名称，保留错误页中的其他全部填写（含勾选）再保存。
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("title", "修正后的名称") if name == "title" else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        new_id = int(
+            re.search(r"highlight=(\d+)$", headers["Location"]).group(1)
+        )
+        self.assertNotIn(new_id, self.expected_ids)
+
+        # 新增一条采用本次完整资料的曲目：失败前填写的选填内容没丢，
+        # 标签按既有规则裁剪、去重；勾选的另存选择不影响这条全新来源。
+        new_record = self.track_by_id(new_id)
+        self.assertEqual(new_record, {
+            "id": new_id,
+            "title": "修正后的名称",
+            "source": "/音乐/修正后保存.flac",
+            "duration": 307.25,
+            "cover_url": "https://img.example/candidate.png",
+            "description": description,
+            "tags": ["候选", "新编"],
+        })
+        # 已有记录保持原样，新记录按标识顺序接在后面。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            self.expected_ids + [new_id],
+        )
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+    def test_fix_only_bad_source_then_listing_shows_saved_title_and_source(self):
+        # 第一次：来源只填空白导致失败，名称与选填资料已填好。
+        failed_fields = self.create_form_fields(
+            title="夜航·现场收录",
+            source=" \t\n ",
+            duration="8",
+            description="现场版本说明",
+            tags="现场",
+        )
+        status, _, failed_page = self.post_create_form(failed_fields)
+        self.assertEqual(status, 400)
+        self.assert_field_error(failed_page, "来源")
+        self.assert_library_unchanged()
+
+        # 只把来源修正为尚未收录的文字，其余内容直接取错误页的回填
+        # （名称、时长、说明、标签都保留失败前的填写）再提交。
+        retry_fields = self.create_fields_from_rendered_page(failed_page)
+        retry_fields = [
+            ("source", "/音乐/夜航/现场.flac") if name == "source"
+            else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        new_id = int(
+            re.search(r"highlight=(\d+)$", headers["Location"]).group(1)
+        )
+
+        # 成功提交后回到列表，显示刚保存的名称与来源。
+        status, _, listing_page = self.server.get_page(headers["Location"])
+        self.assertEqual(status, 200)
+        self.assertIn("夜航·现场收录", listing_page)
+        self.assertIn("/音乐/夜航/现场.flac", listing_page)
+        new_record = self.track_by_id(new_id)
+        self.assertEqual(new_record["title"], "夜航·现场收录")
+        self.assertEqual(new_record["source"], "/音乐/夜航/现场.flac")
+        self.assertEqual(new_record["duration"], 8)
+        self.assertEqual(new_record["tags"], ["现场"])
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            self.expected_ids + [new_id],
+        )
+
+    def test_successful_create_with_chinese_fields_shown_on_listing(self):
+        # 首页成功提交（中文名称、含中文路径的来源、首尾空白）后回到列表，
+        # 显示刚保存的名称与来源，首尾空白已去掉。
+        fields = self.create_form_fields(
+            title="  夜航·序曲  ",
+            source="\t/音乐/现场/序曲.flac\n",
+        )
+        status, headers, _ = self.post_create_form(fields)
+        self.assertEqual(status, 303, headers)
+        new_id = int(
+            re.search(r"highlight=(\d+)$", headers["Location"]).group(1)
+        )
+        status, _, listing_page = self.server.get_page(headers["Location"])
+        self.assertEqual(status, 200)
+        self.assertEqual(parse_listed_tracks(listing_page), [
+            (self.first["id"], "已有曲目·甲"),
+            (self.second["id"], "已有曲目·乙"),
+            (new_id, "夜航·序曲"),
+        ])
+        self.assertIn("/音乐/现场/序曲.flac", listing_page)
+        record = self.track_by_id(new_id)
+        self.assertEqual(record["title"], "夜航·序曲")
+        self.assertEqual(record["source"], "/音乐/现场/序曲.flac")
+        # 省略选填资料的默认结果：时长未知、封面说明为空、标签为空数组。
+        self.assertIsNone(record["duration"])
+        self.assertEqual(record["cover_url"], "")
+        self.assertEqual(record["description"], "")
+        self.assertEqual(record["tags"], [])
 
 
 if __name__ == "__main__":
