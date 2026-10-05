@@ -346,6 +346,28 @@ def esc(value):
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def normalize_newlines(text):
+    """把提交内容的 CRLF/CR 换行统一成 LF。
+
+    浏览器提交 textarea 时会把框内换行按 CRLF 编码，旧记录也可能直接
+    收录了 CR；比较与保存都以 LF 形态进行，避免同一段文字因换行写法
+    不同被当成已修改。
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def textarea_content(text):
+    """生成 textarea 起始标签后、结束标签前的安全文本。
+
+    HTML 解析规则会忽略 textarea 起始标签之后紧跟的第一个换行（CRLF
+    算作一个），因此原文以换行开头时要额外补一个换行，框内才能还原
+    开头空行；原文不以换行开头时不能补，否则会凭空多出一行。
+    """
+    if text.startswith(("\n", "\r")):
+        return "\n" + esc(text)
+    return esc(text)
+
+
 def format_duration(value):
     if value is None:
         return None
@@ -450,7 +472,7 @@ def render_track_form(form, error, error_field, *, action, submit_label,
   <input type="text" id="f-cover-url" name="cover_url" value="{value("cover_url")}">
   {inline_error("cover_url")}
   <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
-  <textarea id="f-description" name="description">{esc(form.get("description", ""))}</textarea>
+  <textarea id="f-description" name="description">{textarea_content(form.get("description", ""))}</textarea>
   {inline_error("description")}
   {tags_field}
   {checkbox}<button type="submit">{esc(submit_label)}</button>
@@ -704,19 +726,20 @@ def form_to_payload(form, *, edit_mode=False):
     if edit_mode:
         # 每个同名字段对应编辑页的一个标签输入框，字段内部的换行原样保留；
         # 浏览器按 CRLF 提交，统一归一化为 LF，使保存结果与接口原文收录一致。
-        tags = [
-            part.replace("\r\n", "\n").replace("\r", "\n")
-            for part in form.get("tags", [])
-        ]
+        tags = [normalize_newlines(part) for part in form.get("tags", [])]
+        # 说明框同样会被浏览器按 CRLF 提交：先归一化为 LF，调用方再据此
+        # 判断用户是否真的改过说明，改了才按本次文字（LF 换行）保存。
+        description = normalize_newlines(one("description"))
     else:
         tags = [part for part in re.split(r"[,，、]+", one("tags"))]
+        description = one("description")
 
     payload = {
         "title": one("title"),
         "source": one("source"),
         "duration": duration,
         "cover_url": one("cover_url"),
-        "description": one("description"),
+        "description": description,
         "tags": tags,
         "save_as_new_version": one("save_as_new_version") in ("1", "on", "true", "yes"),
     }
@@ -871,14 +894,26 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
+            # 失败重绘时按 LF 回填说明框（浏览器以 CRLF 提交换行），
+            # 连同开头空行、段落空行、结尾空行与首尾空格一起保留。
+            form_view["description"] = normalize_newlines(
+                form_view["description"]
+            )
             # 失败重绘时逐框回填用户本次填写的标签，保留项之间的边界与
             # 项内换行，末尾再附一个空框便于继续新增。
             form_view["tags_items"] = [
-                part.replace("\r\n", "\n").replace("\r", "\n")
-                for part in form.get("tags", [])
+                normalize_newlines(part) for part in form.get("tags", [])
             ] + [""]
             try:
                 payload = form_to_payload(form, edit_mode=True)
+                # 用户没有修改说明时（提交文字在换行归一化后与原说明一致），
+                # 不提交该字段：原说明逐字节保留，LF/CRLF 写法、首尾空白、
+                # 空串与纯空白说明的区别都不因本次保存被改写；确实改了说明
+                # 时才按本次填写保存（换行统一为 LF）。
+                if payload["description"] == normalize_newlines(
+                    record["description"]
+                ):
+                    del payload["description"]
                 # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
                 # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
                 if record["source"] is None and not payload["source"].strip():

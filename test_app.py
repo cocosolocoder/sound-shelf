@@ -115,6 +115,29 @@ def parse_input_value(page, field_id, name):
     return html.unescape(match.group(1))
 
 
+def parse_description_box(page):
+    """提取编辑页说明框在浏览器中呈现的文字（模拟 HTML 解析规则）。
+
+    浏览器会忽略 textarea 起始标签后紧跟的第一个换行（CRLF 算作一个），
+    并把标记中的 CRLF/CR 当作 LF；服务端需要补写开头换行来抵消该规则。
+    """
+    match = DESCRIPTION_RE.search(page)
+    assert match is not None, "页面中找不到说明输入框"
+    inner = html.unescape(match.group(1))
+    if inner.startswith("\r\n"):
+        inner = inner[2:]
+    elif inner.startswith(("\n", "\r")):
+        inner = inner[1:]
+    return inner.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def description_box_markup(page):
+    """返回说明框 textarea 的整段标记，用于断言转义发生在该框内部。"""
+    match = DESCRIPTION_RE.search(page)
+    assert match is not None, "页面中找不到说明输入框"
+    return match.group(0)
+
+
 def duration_text(value):
     """与 app.duration_to_text 相同的表单回填文本。"""
     if value is None:
@@ -1366,6 +1389,441 @@ class EditPageTagSaveFailureTest(ServerTestCase):
         reopened = self.get_edit_page(self.track_id)
         self.assert_tag_boxes(reopened, edited_tags_lf + [""])
         self.assert_form_values(reopened, duration="240")
+
+
+class EditPageDescriptionRenderTest(ServerTestCase):
+    """打开编辑页：说明框完整还原原说明的空行、换行与首尾空格。"""
+
+    MULTIBLANK_DESCRIPTION = "\n\n第一段说明\n\n第二段说明\n"
+
+    def test_leading_paragraph_and_trailing_blank_lines_render_in_box(self):
+        track = self.create_track(
+            title="空行说明曲目",
+            source="/music/blanks.flac",
+            description=self.MULTIBLANK_DESCRIPTION,
+        )
+        page = self.get_edit_page(track["id"])
+        shown = parse_description_box(page)
+        # 开头两个空行、段落之间的空行、结尾空行都出现在相同位置。
+        self.assertEqual(shown, self.MULTIBLANK_DESCRIPTION)
+        self.assertEqual(
+            shown.split("\n"),
+            ["", "", "第一段说明", "", "第二段说明", ""],
+        )
+        # 服务端在标记里补写了一个开头换行，抵消 HTML 解析吞掉首换行的
+        # 规则（原文两个开头换行，标记里共三个，解析后剩两个）。
+        self.assertIn(
+            'name="description">\n\n\n第一段说明',
+            description_box_markup(page),
+        )
+
+    def test_normal_description_gains_no_extra_blank_line(self):
+        track = self.create_track(
+            title="普通说明曲目",
+            source="/music/plain.flac",
+            description="普通说明\n第二行",
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_description_box(page), "普通说明\n第二行")
+        # 没有开头空行时不能凭空补一行：正文紧跟在起始标签之后。
+        self.assertIn(
+            'name="description">普通说明',
+            description_box_markup(page),
+        )
+
+    def test_empty_description_box_is_truly_empty(self):
+        track = self.create_track(
+            title="空说明曲目", source="/music/empty.flac", description=""
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_description_box(page), "")
+        self.assertIn(
+            '<textarea id="f-description" name="description"></textarea>',
+            page,
+        )
+
+    def test_whitespace_only_descriptions_render_distinctly(self):
+        cases = {
+            "spaces": "   ",
+            "blank-lines": "\n\n",
+            "mixed": "  \n \t\n ",
+        }
+        for name, description in cases.items():
+            with self.subTest(case=name):
+                track = self.create_track(
+                    title=name,
+                    source=f"/music/{name}.flac",
+                    description=description,
+                )
+                page = self.get_edit_page(track["id"])
+                self.assertEqual(
+                    parse_description_box(page), description, name
+                )
+
+    def test_leading_and_trailing_spaces_are_preserved(self):
+        description = "\n  缩进开头的第一段（两侧留空格）  \n\t制表符结尾\n"
+        track = self.create_track(
+            title="首尾空格曲目",
+            source="/music/spaces.flac",
+            description=description,
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_description_box(page), description)
+
+    def test_crlf_description_renders_with_same_blank_lines(self):
+        description_crlf = self.MULTIBLANK_DESCRIPTION.replace("\n", "\r\n")
+        track = self.create_track(
+            title="CRLF 说明曲目",
+            source="/music/crlf.flac",
+            description=description_crlf,
+        )
+        page = self.get_edit_page(track["id"])
+        # 浏览器把框内 CRLF 呈现为同样的换行与空行位置。
+        self.assertEqual(
+            parse_description_box(page), self.MULTIBLANK_DESCRIPTION
+        )
+
+    def test_html_looking_text_is_displayed_as_plain_text(self):
+        description = (
+            '中文“引号”与英文"引号"\n'
+            "<尖括号> 与 <img src=x onerror=alert(1)> 看起来像标签\n"
+            "</textarea><script>alert(1)</script>  结尾两空格"
+        )
+        track = self.create_track(
+            title="特殊字符曲目",
+            source="/music/special.flac",
+            description=description,
+        )
+        page = self.get_edit_page(track["id"])
+        # 文字原样回到框内，包括结尾两个空格。
+        self.assertEqual(parse_description_box(page), description)
+        markup = description_box_markup(page)
+        # 尖括号、引号都被转义，说明文字不会变成页面元素。
+        self.assertNotIn("<script>", markup)
+        self.assertNotIn("<img ", markup)
+        self.assertNotIn("</textarea><", markup)
+        self.assertIn("&lt;script&gt;", markup)
+        self.assertIn("&lt;/textarea&gt;", markup)
+        self.assertIn("&quot;引号&quot;", markup)
+        self.assertNotIn('<script>alert(1)</script>', page)
+
+
+class EditPageDescriptionUntouchedSaveTest(ServerTestCase):
+    """不碰说明框、只改名称等其他资料：保存后说明必须逐字节不变。"""
+
+    MULTIBLANK_LF = "\n\n第一段说明\n\n第二段说明\n"
+
+    def save_untouched_form(self, track, *, description_submitted):
+        """模拟浏览器整表提交：改名称、改封面，说明按给定文字原样提交。"""
+        fields = self.edit_form_fields(
+            title="新名称",
+            source="/music/desc.flac",
+            duration="212",
+            cover_url="https://img.example/new.png",
+            description=description_submitted,
+            tags=["原标签"],
+        )
+        status, headers, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track['id']}&edited=1"
+        )
+        return self.track_by_id(track["id"])
+
+    def test_lf_description_survives_browser_crlf_submission(self):
+        track = self.create_track(
+            title="原名",
+            source="/music/desc.flac",
+            duration=212,
+            cover_url="https://img.example/old.png",
+            description=self.MULTIBLANK_LF,
+            tags=["原标签"],
+        )
+        # 浏览器把框内换行按 CRLF 提交。
+        record = self.save_untouched_form(
+            track,
+            description_submitted=self.MULTIBLANK_LF.replace("\n", "\r\n"),
+        )
+        self.assertEqual(record["title"], "新名称")
+        self.assertEqual(record["cover_url"], "https://img.example/new.png")
+        # 说明与保存前逐字节相同：仍是 LF，开头/段落/结尾空行都在。
+        self.assertEqual(record["description"], self.MULTIBLANK_LF)
+        self.assertNotIn("\r", record["description"])
+        self.assertEqual(record["tags"], ["原标签"])
+        self.assertEqual(record["id"], track["id"])
+
+    def test_crlf_description_survives_crlf_submission(self):
+        description_crlf = self.MULTIBLANK_LF.replace("\n", "\r\n")
+        track = self.create_track(
+            title="原名",
+            source="/music/desc.flac",
+            duration=212,
+            description=description_crlf,
+        )
+        record = self.save_untouched_form(
+            track, description_submitted=description_crlf
+        )
+        # 原说明的 CRLF 写法逐字节保留，没有被改成 LF。
+        self.assertEqual(record["description"], description_crlf)
+
+    def test_raw_lf_submission_also_keeps_original(self):
+        track = self.create_track(
+            title="原名",
+            source="/music/desc.flac",
+            duration=212,
+            description=self.MULTIBLANK_LF,
+        )
+        # 非浏览器客户端直接按 LF 提交同样的文字：仍是“未改动”，原样保留。
+        record = self.save_untouched_form(
+            track, description_submitted=self.MULTIBLANK_LF
+        )
+        self.assertEqual(record["description"], self.MULTIBLANK_LF)
+
+    def test_roundtrip_through_rendered_page_keeps_original_bytes(self):
+        for name, original in (
+            ("lf", self.MULTIBLANK_LF),
+            ("crlf", self.MULTIBLANK_LF.replace("\n", "\r\n")),
+        ):
+            with self.subTest(case=name):
+                track = self.create_track(
+                    title=f"原名-{name}",
+                    source=f"/music/{name}.flac",
+                    duration=212,
+                    description=original,
+                )
+                # 从真实编辑页取框内文字，再按浏览器方式（CRLF）提交。
+                page = self.get_edit_page(track["id"])
+                shown = parse_description_box(page)
+                fields = self.edit_form_fields(
+                    title=f"新名称-{name}",
+                    source=f"/music/{name}.flac",
+                    duration="212",
+                    description=shown.replace("\n", "\r\n"),
+                )
+                status, _, resp = self.post_edit_form(track["id"], fields)
+                self.assertEqual(status, 303, resp[:500])
+                self.assertEqual(
+                    self.track_by_id(track["id"])["description"], original
+                )
+
+    def test_empty_blank_and_spaces_descriptions_are_not_swapped(self):
+        # 看起来都“没有正文”，但空串、纯空行、纯空格必须各自保留。
+        variants = ["", "\n", "\n\n", " ", "   ", " \n \t"]
+        for index, original in enumerate(variants):
+            with self.subTest(original=repr(original)):
+                track = self.create_track(
+                    title=f"变体 {index}",
+                    source=f"/music/variant-{index}.flac",
+                    description=original,
+                )
+                page = self.get_edit_page(track["id"])
+                shown = parse_description_box(page)
+                fields = self.edit_form_fields(
+                    title=f"变体 {index} 改名",
+                    source=f"/music/variant-{index}.flac",
+                    description=shown.replace("\n", "\r\n"),
+                )
+                status, _, resp = self.post_edit_form(track["id"], fields)
+                self.assertEqual(status, 303, resp[:500])
+                self.assertEqual(
+                    self.track_by_id(track["id"])["description"], original
+                )
+
+    def test_repeated_saves_keep_description_stable(self):
+        track = self.create_track(
+            title="原名",
+            source="/music/desc.flac",
+            duration=212,
+            description=self.MULTIBLANK_LF,
+        )
+        for round_index in range(2):
+            page = self.get_edit_page(track["id"])
+            shown = parse_description_box(page)
+            fields = self.edit_form_fields(
+                title=f"改名第 {round_index} 次",
+                source="/music/desc.flac",
+                duration="212",
+                description=shown.replace("\n", "\r\n"),
+            )
+            status, _, resp = self.post_edit_form(track["id"], fields)
+            self.assertEqual(status, 303, resp[:500])
+            self.assertEqual(
+                self.track_by_id(track["id"])["description"],
+                self.MULTIBLANK_LF,
+            )
+
+
+class EditPageDescriptionChangesTest(ServerTestCase):
+    """确实编辑说明时按本次填写保存，未改动保护不禁止修改。"""
+
+    def test_edited_description_is_saved_with_lf_newlines(self):
+        track = self.create_track(
+            title="说明可改曲目",
+            source="/music/edit-desc.flac",
+            duration=100,
+            description="旧说明\n第二行",
+            tags=["旧标签"],
+        )
+        new_description = "\n\n新的开头空行\n\n新第二段\n"
+        fields = self.edit_form_fields(
+            title="说明可改曲目",
+            source="/music/edit-desc.flac",
+            duration="100",
+            description=new_description.replace("\n", "\r\n"),
+            tags=["旧标签"],
+        )
+        status, headers, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track['id']}&edited=1"
+        )
+        record = self.track_by_id(track["id"])
+        # 保存的是本次填写的文字与空行安排（换行统一为 LF），不是旧说明。
+        self.assertEqual(record["description"], new_description)
+        self.assertEqual(record["tags"], ["旧标签"])
+
+        # 再次打开编辑页，框内就是新说明。
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_description_box(page), new_description)
+
+    def test_clearing_description_saves_empty_string(self):
+        track = self.create_track(
+            title="删空说明曲目",
+            source="/music/clear.flac",
+            description="原本有说明",
+        )
+        fields = self.edit_form_fields(
+            title="删空说明曲目",
+            source="/music/clear.flac",
+            description="",
+        )
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["description"], ""
+        )
+
+    def test_changing_text_to_whitespace_only_saves_whitespace(self):
+        track = self.create_track(
+            title="改成空白曲目",
+            source="/music/whitespace.flac",
+            description="有正文的说明",
+        )
+        fields = self.edit_form_fields(
+            title="改成空白曲目",
+            source="/music/whitespace.flac",
+            description="  \n ".replace("\n", "\r\n"),
+        )
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["description"], "  \n "
+        )
+
+    def test_changing_empty_description_to_text_saves_text(self):
+        track = self.create_track(
+            title="补写说明曲目",
+            source="/music/fill.flac",
+            description="",
+        )
+        fields = self.edit_form_fields(
+            title="补写说明曲目",
+            source="/music/fill.flac",
+            description="新补写的说明",
+        )
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["description"], "新补写的说明"
+        )
+
+
+class EditPageDescriptionSaveFailureTest(ServerTestCase):
+    """其他字段非法导致保存失败：记录不变，说明按本次填写回填，修正后可保存。"""
+
+    def test_failure_reprints_submitted_description_with_leading_blanks(self):
+        original = "\n\n原始第一段\n\n原始第二段\n"
+        track = self.create_track(
+            title="失败重试曲目",
+            source="/music/retry.flac",
+            duration=212,
+            description=original,
+        )
+        # 用户改了说明（开头三个空行），同时把时长误填成负数。
+        edited = "\n\n\n本次填写的说明\n开头三个空行\n结尾空行\n"
+        fields = self.edit_form_fields(
+            title="失败重试曲目",
+            source="/music/retry.flac",
+            duration="-5",
+            description=edited.replace("\n", "\r\n"),
+        )
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner)
+        self.assertIn("时长", strip_tags(banner.group(1)))
+
+        # 原曲目保持原样：说明仍是旧原文。
+        self.assertEqual(
+            self.track_by_id(track["id"])["description"], original
+        )
+        # 重绘页面回填本次填写的说明，开头三个空行一行不少，
+        # 既不是旧说明，也不是少了一行的版本。
+        self.assertEqual(parse_description_box(page), edited)
+        self.assert_form_values(page, duration="-5")
+
+        # 只把时长修正为正数后继续保存：保存回填的说明内容。
+        reprinted = parse_description_box(page)
+        fields = self.edit_form_fields(
+            title="失败重试曲目",
+            source="/music/retry.flac",
+            duration="240",
+            description=reprinted.replace("\n", "\r\n"),
+        )
+        status, headers, resp = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, resp[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track['id']}&edited=1"
+        )
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["description"], edited)
+        self.assertEqual(record["duration"], 240)
+
+    def test_failure_with_untouched_description_reprints_original_blanks(self):
+        original = "\n\n原始第一段\n\n原始第二段\n"
+        track = self.create_track(
+            title="未动说明曲目",
+            source="/music/untouched.flac",
+            duration=212,
+            description=original,
+        )
+        # 用户没碰说明框（框内文字按 CRLF 提交），只把时长填成负数。
+        fields = self.edit_form_fields(
+            title="未动说明曲目",
+            source="/music/untouched.flac",
+            duration="-5",
+            description=original.replace("\n", "\r\n"),
+        )
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        # 记录完全不变；重绘的说明仍是原说明，开头空行不丢。
+        self.assertEqual(
+            self.track_by_id(track["id"])["description"], original
+        )
+        self.assertEqual(parse_description_box(page), original)
+
+        # 修正时长后保存：说明未改动，仍为原说明。
+        fields = self.edit_form_fields(
+            title="未动说明曲目",
+            source="/music/untouched.flac",
+            duration="240",
+            description=original.replace("\n", "\r\n"),
+        )
+        status, headers, resp = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, resp[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["description"], original)
+        self.assertEqual(record["duration"], 240)
 
 
 class CreateDuplicateSourceApiTest(ServerTestCase):
