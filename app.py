@@ -426,13 +426,22 @@ def render_track_form(form, error, error_field, *, action, submit_label,
         tag_items = form.get("tags_items")
         if tag_items is None:
             tag_items = [""]
+        # 每个框配一个隐藏域，记录它对应的原始标签序号：保存时据此把
+        # 未修改的框还原成原始完整文字（含原来的 LF/CRLF/CR 换行写法），
+        # 新增的框没有序号。隐藏域与输入框同在一个条目里，删除该框时
+        # 一起移除；每个框都带隐藏域（新增框留空），保证提交后同名
+        # 字段按顺序一一对应。
+        tag_refs = list(form.get("tags_refs") or [])
+        if len(tag_refs) < len(tag_items):
+            tag_refs += [""] * (len(tag_items) - len(tag_refs))
         tag_inputs = []
-        for tag_text in tag_items:
+        for tag_text, tag_ref in zip(tag_items, tag_refs):
             # 框高随该项实际行数自适应，让项内换行一目了然。
             rows = min(max(2, tag_text.count("\n") + 2), 10)
             tag_inputs.append(
                 '<div class="tag-edit-item">\n'
                 f'  <textarea name="tags" rows="{rows}">{esc(tag_text)}</textarea>\n'
+                f'  <input type="hidden" name="tags_ref" value="{esc(tag_ref)}">\n'
                 '  <button type="button" class="tag-remove" '
                 'data-tag-remove="1">删除这一项</button>\n'
                 '</div>'
@@ -631,12 +640,18 @@ form.track-form button.tag-add{{margin-top:.6rem;padding:.35rem .9rem;font-size:
       var box = document.createElement('textarea');
       box.name = 'tags';
       box.rows = 2;
+      // 新增的框没有对应的原始标签，隐藏序号留空，与既有框的字段一一对应。
+      var ref = document.createElement('input');
+      ref.type = 'hidden';
+      ref.name = 'tags_ref';
+      ref.value = '';
       var remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'tag-remove';
       remove.setAttribute('data-tag-remove', '1');
       remove.textContent = '删除这一项';
       item.appendChild(box);
+      item.appendChild(ref);
       item.appendChild(remove);
       list.appendChild(item);
       box.focus();
@@ -699,6 +714,30 @@ def render_track(record, highlight=None):
 
 
 render_track.highlight = None
+
+
+def reconcile_edit_tags(submitted, refs, originals):
+    """把编辑页提交的标签逐项对齐到原始标签，决定最终保存的完整文字。
+
+    submitted 为各框文字（已归一化为 LF），refs 为各框对应的原始标签
+    序号（新增框为空，序号越界或缺失时按新增处理）。框内文字去掉首尾
+    空白、换行归一化后与对应原始项一致时，视为未修改：保留原始项的
+    完整原文（含 LF/CRLF/CR 换行写法），浏览器显示与提交换行的写法
+    差异不算修改；否则按本次填写的文字保存。首尾空白裁剪、空项忽略
+    与按最终完整文字去重仍交由统一校验规则处理。
+    """
+    final = []
+    for index, text in enumerate(submitted):
+        ref = refs[index].strip() if index < len(refs) else ""
+        if ref.isdigit():
+            position = int(ref)
+            if position < len(originals):
+                original = originals[position]
+                if text.strip() == normalize_newlines(original).strip():
+                    final.append(original)
+                    continue
+        final.append(text)
+    return final
 
 
 def form_to_payload(form, *, edit_mode=False):
@@ -876,8 +915,10 @@ def main():
                 "duration": duration_to_text(record["duration"]),
                 "cover_url": record["cover_url"],
                 "description": record["description"],
-                # 每个标签项一个输入框，完整保留各项的文字（含项内换行）、边界和顺序。
+                # 每个标签项一个输入框，完整保留各项的文字（含项内换行）、边界和顺序；
+                # 隐藏域记录各项对应的原始标签序号，保存时据此还原未修改项的原文。
                 "tags_items": list(record["tags"]) + [""],
+                "tags_refs": [str(i) for i in range(len(record["tags"]))] + [""],
             }
             self.respond(
                 200,
@@ -900,12 +941,25 @@ def main():
                 form_view["description"]
             )
             # 失败重绘时逐框回填用户本次填写的标签，保留项之间的边界与
-            # 项内换行，末尾再附一个空框便于继续新增。
-            form_view["tags_items"] = [
+            # 项内换行，连同各项对应的原始标签序号一起回填：修正出错字段后
+            # 再次保存，未修改的项仍能还原原始完整文字，不因经过错误页面
+            # 丢掉一项或改写原文。末尾再附一个空框便于继续新增。
+            submitted_tags = [
                 normalize_newlines(part) for part in form.get("tags", [])
-            ] + [""]
+            ]
+            submitted_refs = form.get("tags_ref", [])
+            form_view["tags_items"] = submitted_tags + [""]
+            form_view["tags_refs"] = submitted_refs + [""]
             try:
                 payload = form_to_payload(form, edit_mode=True)
+                # 用户没有修改的框（文字与内部空行不变，或仅整项首尾增加
+                # 空白）保留原始标签的完整文字：LF/CRLF/CR 换行写法不被
+                # 改写，仅换行写法不同的两项也不会被合并；确实修改或新增
+                # 的项按本次填写（换行统一为 LF）保存，去重以最终要保存
+                # 的完整文字为准。
+                payload["tags"] = reconcile_edit_tags(
+                    submitted_tags, submitted_refs, record["tags"]
+                )
                 # 用户没有修改说明时（提交文字在换行归一化后与原说明一致），
                 # 不提交该字段：原说明逐字节保留，LF/CRLF 写法、首尾空白、
                 # 空串与纯空白说明的区别都不因本次保存被改写；确实改了说明

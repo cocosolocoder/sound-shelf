@@ -42,6 +42,9 @@
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
   按完整文字首次出现去重、清空保存为空数组；其他字段非法导致保存失败时
   整条记录不变，本次填写的标签逐框回填，修正后保存回填内容。
+- 标签原文含 CRLF/CR 换行时，未修改（或仅整项首尾增加空白）的框保存后
+  保留该项原来的完整文字，仅换行写法不同的两项不被合并；确实修改的项
+  按本次填写（LF）保存，其余项原文不变；失败重绘后修正再保存同样如此。
 
 运行：python3 -m unittest test_app -v
 """
@@ -64,6 +67,10 @@ APP = Path(__file__).resolve().parent / "app.py"
 # 编辑页每个标签项渲染成一个同名 textarea，按文档先后顺序提交。
 TAG_BOX_RE = re.compile(
     r'<textarea name="tags"[^>]*>(.*?)</textarea>', re.DOTALL
+)
+# 每个标签框配一个隐藏域，记录该框对应的原始标签序号（新增框为空）。
+TAG_REF_RE = re.compile(
+    r'<input type="hidden" name="tags_ref" value="(.*?)"'
 )
 TEXT_INPUT_RE_TEMPLATE = (
     r'<input type="text" id="f-{fid}" name="{name}"[^>]*?value="(.*?)"[^>]*?>'
@@ -106,6 +113,16 @@ def strip_tags(markup):
 def parse_tag_boxes(page):
     """按页面顺序提取编辑页每个标签输入框的文字（已还原 HTML 转义）。"""
     return [html.unescape(raw) for raw in TAG_BOX_RE.findall(page)]
+
+
+def parse_tag_refs(page):
+    """按页面顺序提取每个标签框对应的原始标签序号（新增框为空串）。"""
+    return [html.unescape(raw) for raw in TAG_REF_RE.findall(page)]
+
+
+def browser_newlines(text):
+    """模拟浏览器提交 textarea：框内换行一律按 CRLF 编码。"""
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
 
 
 def parse_input_value(page, field_id, name):
@@ -1389,6 +1406,202 @@ class EditPageTagSaveFailureTest(ServerTestCase):
         reopened = self.get_edit_page(self.track_id)
         self.assert_tag_boxes(reopened, edited_tags_lf + [""])
         self.assert_form_values(reopened, duration="240")
+
+
+class EditPageTagNewlinePreservationTest(ServerTestCase):
+    """标签原文含 CRLF/CR 换行：未修改的项保存后逐字节不变、不被合并。
+
+    准备数据的四项标签覆盖：仅换行写法不同（CRLF 与 LF）的两项“自然/雨声”、
+    含单独 CR 换行的一项、含标点的一项。接口收录时按完整文字保存，编辑页
+    未修改的框在保存后必须保留各自原文。
+    """
+
+    CRLF_TAG = "自然\r\n雨声"
+    LF_TAG = "自然\n雨声"
+    CR_TAG = "风声\r落叶"
+    PUNCT_TAG = "晨间，鸟鸣、溪流"
+    INITIAL_TAGS = [CRLF_TAG, LF_TAG, CR_TAG, PUNCT_TAG]
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            description="清晨山涧录音",
+            tags=self.INITIAL_TAGS,
+        )
+        self.track_id = self.track["id"]
+
+    def fetch_tag_pairs(self, track_id=None):
+        """从真实编辑页取回 [(框内文字, 原始序号), ...]，模拟浏览器打开页面。"""
+        page = self.get_edit_page(track_id or self.track_id)
+        boxes = parse_tag_boxes(page)
+        refs = parse_tag_refs(page)
+        self.assertEqual(
+            len(refs), len(boxes),
+            f"每个标签框都应配一个原始序号隐藏域：{refs!r} vs {boxes!r}",
+        )
+        return list(zip(boxes, refs))
+
+    def submit_tag_pairs(self, pairs, track_id=None, **fields):
+        """模拟浏览器整表提交：框内换行按 CRLF 编码，序号隐藏域随框提交。"""
+        form = self.edit_form_fields(
+            title=fields.pop("title", "山涧晨曲"),
+            source=fields.pop("source", "/music/shanjian.flac"),
+            duration=fields.pop("duration", "212"),
+            description=fields.pop("description", "清晨山涧录音"),
+            tags=[browser_newlines(text) for text, _ in pairs],
+            **fields,
+        )
+        form.extend(("tags_ref", ref) for _, ref in pairs)
+        return self.post_edit_form(track_id or self.track_id, form)
+
+    def test_edit_page_marks_each_box_with_its_original_index(self):
+        pairs = self.fetch_tag_pairs()
+        # 四个已有框依次对应原始序号 0..3，末尾新增框没有序号。
+        self.assertEqual(
+            pairs,
+            [(self.CRLF_TAG, "0"), (self.LF_TAG, "1"),
+             (self.CR_TAG, "2"), (self.PUNCT_TAG, "3"), ("", "")],
+        )
+
+    def test_save_without_touching_tags_preserves_original_bytes(self):
+        # 直接保存（只改名称）：四项原文逐字节保留，CRLF/LF 两项不被合并。
+        status, headers, page = self.submit_tag_pairs(
+            self.fetch_tag_pairs(), title="山涧晨曲（定稿）",
+        )
+        self.assertEqual(status, 303, page[:500])
+
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], "山涧晨曲（定稿）")
+        self.assertEqual(record["tags"], self.INITIAL_TAGS)
+        self.assertIn("\r\n", record["tags"][0])
+        self.assertNotIn("\r", record["tags"][1])
+        self.assertIn("\r", record["tags"][2])
+        self.assertNotIn("\r\n", record["tags"][2])
+
+    def test_repeated_untouched_saves_keep_tags_stable(self):
+        for round_index in range(2):
+            status, _, page = self.submit_tag_pairs(
+                self.fetch_tag_pairs(), title=f"改名第 {round_index} 次",
+            )
+            self.assertEqual(status, 303, page[:500])
+            self.assertEqual(
+                self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+            )
+
+    def test_deleting_one_newline_variant_keeps_the_others_raw_text(self):
+        # 两项画面相同、仅换行写法不同：删掉 CRLF 项，LF 项保留自己的原文。
+        pairs = self.fetch_tag_pairs()
+        del pairs[0]
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.LF_TAG, self.CR_TAG, self.PUNCT_TAG],
+        )
+
+    def test_deleting_lf_variant_keeps_crlf_variant_raw_text(self):
+        # 反向对照：删掉 LF 项，CRLF 项的换行写法不被改写。
+        pairs = self.fetch_tag_pairs()
+        del pairs[1]
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, self.CR_TAG, self.PUNCT_TAG],
+        )
+
+    def test_surrounding_whitespace_only_still_counts_as_untouched(self):
+        # 只给整项首尾增加空白：保留原项内部的换行写法。
+        pairs = self.fetch_tag_pairs()
+        pairs[0] = ("  " + pairs[0][0] + "\t ", pairs[0][1])
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_modifying_one_item_saves_lf_for_it_and_keeps_other_raw_texts(self):
+        # 确实修改第二项的文字：该项按本次填写（LF）保存，其余项原文不变。
+        pairs = self.fetch_tag_pairs()
+        pairs[1] = ("雨声\r\n新版本", pairs[1][1])
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, "雨声\n新版本", self.CR_TAG, self.PUNCT_TAG],
+        )
+
+    def test_new_item_deduplicates_against_final_full_text_only(self):
+        # 新增一项与 LF 项最终文字完全相同：按首次出现去重；
+        # 但 CRLF 项不因画面相同被合并。
+        pairs = self.fetch_tag_pairs()
+        pairs.append(("自然\n雨声", ""))
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.INITIAL_TAGS
+        )
+
+    def test_modified_item_matching_another_final_text_is_deduplicated(self):
+        # 把 CR 项改成与 LF 项完全相同的文字：修改后的标签正常参与去重。
+        pairs = self.fetch_tag_pairs()
+        pairs[2] = ("自然\n雨声", pairs[2][1])
+        status, _, page = self.submit_tag_pairs(pairs)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"],
+            [self.CRLF_TAG, self.LF_TAG, self.PUNCT_TAG],
+        )
+
+    def test_failed_save_reprint_keeps_refs_and_retry_preserves_originals(self):
+        # 时长不合法导致保存失败：记录不变，回填页面仍带各项原始序号。
+        status, _, page = self.submit_tag_pairs(
+            self.fetch_tag_pairs(), duration="-5",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        boxes = parse_tag_boxes(page)
+        refs = parse_tag_refs(page)
+        # 提交时的末尾空框也逐框回填，页面再附一个空框。
+        self.assertEqual(refs, ["0", "1", "2", "3", "", ""])
+        # 回填框内文字按 LF 呈现（浏览器提交写法的归一化结果）。
+        self.assertEqual(
+            boxes,
+            ["自然\n雨声", "自然\n雨声", "风声\n落叶", self.PUNCT_TAG, "", ""],
+        )
+
+        # 只修正时长后再次保存：未修改的各项仍还原原始完整文字，
+        # 不因经过错误页面丢掉一项或把 CRLF/CR 改写成 LF。
+        retry_pairs = list(zip(boxes, refs))
+        status, headers, page = self.submit_tag_pairs(
+            retry_pairs, duration="240",
+        )
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["duration"], 240)
+        self.assertEqual(record["tags"], self.INITIAL_TAGS)
+
+    def test_source_conflict_reprint_and_retry_preserves_originals(self):
+        # 来源冲突导致保存失败：同样回填序号，修正后来源与标签都正确保存。
+        self.create_track(title="占位", source="/music/taken.flac")
+        status, _, page = self.submit_tag_pairs(
+            self.fetch_tag_pairs(), source="/music/taken.flac",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+        boxes = parse_tag_boxes(page)
+        refs = parse_tag_refs(page)
+        status, _, page = self.submit_tag_pairs(
+            list(zip(boxes, refs)), source="/music/shanjian-2.flac",
+        )
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["source"], "/music/shanjian-2.flac")
+        self.assertEqual(record["tags"], self.INITIAL_TAGS)
 
 
 class EditPageDescriptionRenderTest(ServerTestCase):
