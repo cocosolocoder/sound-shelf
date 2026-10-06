@@ -94,6 +94,22 @@
   同一来源的多个独立版本互不影响，来源未改动不触发重复来源冲突。
   tags 为字符串/对象或数组中混入数字、布尔值、null 等非字符串项时
   返回 400 且 field=tags，整单失败，不保存同次请求中的任何部分内容。
+- 说明（PATCH description）：只提交 description 即更新原记录，成功返回
+  200 与修改后的完整曲目，曲目标识不变，随后列表接口读到的说明与成功响应
+  一致；只改说明时名称、来源、时长、封面与标签保留原值，记录数量与列表
+  顺序不变。说明按提交原文保存：中文、引号、尖括号、形似网页标签的文字、
+  段落间的连续空行以及首尾空格、制表符都是内容，不裁剪、不拆分、不替换；
+  直接接口提交的 LF、CRLF、CR 换行写法各自逐字节保留，不套用网页编辑表单
+  的换行统一规则。修改名称等其他合法资料但省略 description 时原说明完整
+  保留；明确提交空字符串或 null 时说明保存为空字符串；只含空格、制表符或
+  空行的字符串仍按原文保存，不能被当作空字符串——原本有文字、原本为空和
+  原本只有空白的说明都遵守这些规则，修改后的响应与列表读取结果一致。同一
+  来源已有多个独立版本时只改其中一条的说明照常成功，其他版本的完整资料不
+  受影响。description 误传数字、布尔值、数组或对象时返回 400，field 指向
+  description，错误文字明确指出说明类型有误；即使同次请求还提交了合法的
+  新名称或其他资料，也不能保存其中任何一部分，目标曲目和其他曲目的已保存
+  资料都保持提交前的内容；null 的清空含义不能混入这些类型错误，失败后读取
+  列表仍看到原说明，而不会出现本次请求的部分修改或额外记录。
 - 编辑页（GET/POST /tracks/{id}/edit）的标签每个标签项一个输入框：
   接口收录时按完整文字保存的标签（可含换行、中英文逗号、顿号）逐框展示，
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
@@ -6345,6 +6361,473 @@ class EditTagsInvalidTest(ServerTestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["tags"], [])
         self.assertEqual(self.track_by_id(self.track_id)["tags"], [])
+
+
+class EditDescriptionReplaceTest(ServerTestCase):
+    """PATCH 只提交 description：更新原记录并返回修改后的完整资料。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="旧说明",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", tags=["其他"],
+        )
+
+    def assert_rest_of_library_unchanged(self):
+        tracks = self.list_tracks()
+        # 修改的是原有记录：标识不变、不新增曲目，列表顺序不变。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.bystander["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_description_only_patch_updates_existing_record(self):
+        new_description = "新的说明\n第二行：引号 \" ' 与尖括号 < > 保留"
+        status, body = self.patch(self.track_id, {"description": new_description})
+        self.assertEqual(status, 200, body)
+        # 成功返回修改后的完整曲目，曲目标识保持不变。
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "夜航",
+            "source": "/music/yehang.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/yehang.png",
+            "description": new_description,
+            "tags": ["民谣", "现场"],
+        })
+        # 随后从曲目列表接口读到的说明与成功响应一致，整条记录也一致。
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assert_rest_of_library_unchanged()
+
+    def test_only_description_submitted_keeps_all_other_fields(self):
+        status, body = self.patch(self.track_id, {"description": "仅修改说明"})
+        self.assertEqual(status, 200, body)
+        # 只改说明时，名称、来源、时长、封面和标签继续保留原值。
+        self.assertEqual(body["title"], "夜航")
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["duration"], 243.5)
+        self.assertEqual(body["cover_url"], "https://img.example/yehang.png")
+        self.assertEqual(body["tags"], ["民谣", "现场"])
+        self.assertEqual(body["description"], "仅修改说明")
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assert_rest_of_library_unchanged()
+
+    def test_description_patch_keeps_same_id_count_and_order(self):
+        before_ids = [t["id"] for t in self.list_tracks()]
+        status, body = self.patch(self.track_id, {"description": "改说明"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual([t["id"] for t in self.list_tracks()], before_ids)
+        self.assert_rest_of_library_unchanged()
+
+
+class EditDescriptionRawTextTest(ServerTestCase):
+    """PATCH description：接口直接提交的说明按原文保存，不做任何规整。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="原样保存",
+            source="/music/raw.flac",
+            duration=12,
+            cover_url="https://img.example/raw.png",
+            description="初始说明",
+            tags=["标签"],
+        )
+        self.track_id = self.track["id"]
+
+    def assert_description_saved_verbatim(self, description):
+        # json.dumps 会把 CR/LF 按 JSON 转义发送，服务端解码后必须得到与
+        # 提交时完全一致的文字：这仍是直接接口提交，不经过网页表单。
+        status, body = self.patch(self.track_id, {"description": description})
+        self.assertEqual(status, 200, body)
+        self.assertIsInstance(body["description"], str)
+        self.assertEqual(
+            body["description"], description,
+            "说明未按原文保存：\n  实际=%r\n  期望=%r"
+            % (body["description"], description),
+        )
+        listed = self.track_by_id(self.track_id)
+        self.assertEqual(listed["description"], description)
+        self.assertEqual(listed, body)
+
+    def test_chinese_quotes_angle_brackets_and_tag_like_text_kept(self):
+        # 中文、引号、尖括号、看起来像网页标签的文字都属于普通内容，
+        # 不能裁剪、拆分或替换。
+        self.assert_description_saved_verbatim(
+            "中文说明：「引号」\"双引\" '单引'，"
+            "尖括号 < 原样 > 保留，形似标签的 <script>alert(1)</script> "
+            "与 <div class=\"x\"> 都只是文字。"
+        )
+
+    def test_consecutive_blank_lines_between_paragraphs_kept(self):
+        # 段落之间的连续空行（多个换行连着出现）按原文计数保留。
+        self.assert_description_saved_verbatim(
+            "第一段\n\n\n第四段（中间隔着两个空行）\n\n第六段"
+        )
+
+    def test_leading_and_trailing_spaces_and_tabs_kept(self):
+        # 首尾空格、制表符都是说明的内容，不能像名称、来源那样裁掉。
+        self.assert_description_saved_verbatim(" \t 首尾空白都保留 \t ")
+        self.assert_description_saved_verbatim(
+            "\n开头先空一行\n  行内两个空格  \n\t制表符缩进\n结尾空两行\n\n"
+        )
+
+    def test_lf_newlines_submitted_via_api_are_preserved(self):
+        # 直接接口提交的 LF 换行写法逐字节保留。
+        self.assert_description_saved_verbatim("第一行\n第二行\n\n第四行\n")
+
+    def test_crlf_newlines_submitted_via_api_are_preserved(self):
+        # 直接接口提交的 CRLF 换行写法逐字节保留，不能套用网页表单的
+        # CRLF/CR 归一为 LF 规则。
+        description = "第一行\r\n第二行\r\n\r\n第四行\r\n"
+        self.assert_description_saved_verbatim(description)
+        saved = self.track_by_id(self.track_id)["description"]
+        self.assertIn("\r\n", saved)
+        # 不能被归一成 LF：归一化后将不再含任何 CR 字符。
+        self.assertIn("\r", saved)
+
+    def test_cr_newlines_submitted_via_api_are_preserved(self):
+        # 直接接口提交的 CR（老式 Mac）换行写法也逐字节保留。
+        self.assert_description_saved_verbatim("第一行\r第二行\r\r第四行\r")
+
+    def test_three_newline_styles_remain_distinct(self):
+        # LF、CRLF、CR 只是换行写法不同的三段说明各自保存、互不转换：
+        # 连续修改到三种写法后，读回的都必须是本次提交的写法。
+        for description in ("甲\n乙", "甲\r\n乙", "甲\r乙"):
+            with self.subTest(description=description):
+                self.assert_description_saved_verbatim(description)
+
+    def test_mixed_newline_styles_kept_byte_for_byte(self):
+        # 同一段说明里混用三种换行写法时，每个换行符都按原样保留。
+        self.assert_description_saved_verbatim(
+            "LF:\nCRLF:\r\nCR:\r\n收尾：\n\r混合段落\r\n\n结束"
+        )
+
+    def test_whitespace_only_description_is_content_not_empty(self):
+        # 只含空格、制表符或空行的字符串按原文保存，不能被当作空字符串。
+        for description in (" ", "\t", " \t \n\t\n ", "\n\n\n", "   "):
+            with self.subTest(description=description):
+                self.assert_description_saved_verbatim(description)
+
+
+class EditDescriptionOmitAndClearTest(ServerTestCase):
+    """省略 description 保留原文；空字符串与 null 清空；纯空白仍保存。"""
+
+    def setUp(self):
+        super().setUp()
+        # 三种起点：原本有文字、原本为空、原本只有空白（含不同换行写法）。
+        self.text_track = self.create_track(
+            title="有说明", source="/music/with-text.flac",
+            duration=100, description="原有文字\n第二行",
+        )
+        self.empty_track = self.create_track(
+            title="空说明", source="/music/empty.flac",
+            duration=200, description="",
+        )
+        self.blank_track = self.create_track(
+            title="空白说明", source="/music/blank.flac",
+            duration=300, description=" \t\r\n\n ",
+        )
+        self.origins = [
+            ("有文字", self.text_track),
+            ("空", self.empty_track),
+            ("纯空白", self.blank_track),
+        ]
+
+    def test_omitting_description_while_changing_title_keeps_original(self):
+        # 修改名称等其他合法资料但省略 description 时，原说明完整保留，
+        # 原本有文字、原本为空、原本只有空白三种起点都一样。
+        for label, track in self.origins:
+            with self.subTest(origin=label):
+                status, body = self.patch(track["id"], {
+                    "title": track["title"] + "（改名）",
+                })
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["description"], track["description"])
+                self.assertEqual(
+                    self.track_by_id(track["id"])["description"],
+                    track["description"],
+                )
+
+    def test_empty_string_clears_description_for_every_origin(self):
+        # 明确提交空字符串时，说明保存为空字符串。
+        for label, track in self.origins:
+            with self.subTest(origin=label):
+                status, body = self.patch(track["id"], {"description": ""})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["description"], "")
+                self.assertEqual(
+                    self.track_by_id(track["id"])["description"], ""
+                )
+
+    def test_null_clears_description_for_every_origin(self):
+        # 明确提交 null 与空字符串一样把说明清空（null 在这里是清空含义，
+        # 不是类型错误）。
+        for label, track in self.origins:
+            with self.subTest(origin=label):
+                status, body = self.patch(track["id"], {"description": None})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["description"], "")
+                self.assertEqual(
+                    self.track_by_id(track["id"])["description"], ""
+                )
+
+    def test_whitespace_only_is_saved_not_reduced_to_empty(self):
+        # 只含空格、制表符或空行的字符串按原文保存，不能被当作空字符串：
+        # 从有文字、从空、从空白三个起点提交都一样。
+        for label, track in self.origins:
+            for description in (" ", "\t", " \t \n ", "\n\n\n"):
+                with self.subTest(origin=label, description=description):
+                    status, body = self.patch(
+                        track["id"], {"description": description}
+                    )
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(
+                        body["description"], description,
+                        "纯空白说明被改写：实际=%r 期望=%r"
+                        % (body["description"], description),
+                    )
+                    self.assertEqual(
+                        self.track_by_id(track["id"])["description"],
+                        description,
+                    )
+
+    def test_empty_string_and_whitespace_only_are_not_swapped(self):
+        # 清空与改成纯空白必须区分清楚：清空后再只改名称，说明仍是空串；
+        # 改成纯空白后再只改名称，空白原文（含换行写法）继续保留。
+        track_id = self.text_track["id"]
+
+        status, body = self.patch(track_id, {"description": ""})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], "")
+        status, body = self.patch(track_id, {"title": "清空后改名"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], "")
+        self.assertEqual(self.track_by_id(track_id)["description"], "")
+
+        whitespace = " 开头空格\n\t\r\nCRLF 行尾 \r"
+        status, body = self.patch(track_id, {"description": whitespace})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], whitespace)
+        status, body = self.patch(track_id, {"title": "再改一次名"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body["description"], whitespace,
+            "纯空白说明在后续编辑中被改写：实际=%r" % body["description"],
+        )
+        self.assertEqual(
+            self.track_by_id(track_id)["description"], whitespace
+        )
+
+    def test_omitting_description_keeps_raw_newline_bytes(self):
+        # 原本使用 CR/CRLF 写法的纯空白或多行说明，省略 description 只改
+        # 其他资料时，换行写法逐字节保留，不被网页表单式的归一化影响。
+        cases = ("首行\r\n次行\r\n", "纯空白\r\n \r", "首行\r次行\r", " \r \n")
+        for index, description in enumerate(cases):
+            track = self.create_track(
+                title=f"换行写法{index}",
+                source=f"/music/newline/{index}.flac",
+                description=description,
+            )
+            status, body = self.patch(track["id"], {"duration": 9})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["description"], description)
+            self.assertEqual(
+                self.track_by_id(track["id"])["description"], description
+            )
+
+
+class EditDescriptionSameSourceVersionsTest(ServerTestCase):
+    """同一来源多个独立版本：只改其中一条说明，其他版本完整资料不受影响。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/v1.png",
+            description="首版说明\n第二行",
+            tags=["民谣", "首版"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            cover_url="https://img.example/v2.png",
+            description="重制说明",
+            tags=["民谣", "重制"],
+            save_as_new_version=True,
+        )
+        self.third = self.create_track(
+            title="夜航·现场",
+            source="/music/yehang.flac",
+            duration=None,
+            description="",
+            tags=[],
+            save_as_new_version=True,
+        )
+
+    def test_edit_description_of_one_version_succeeds_without_conflict(self):
+        # 来源未改动，只改说明不能触发重复来源冲突。
+        new_description = "重制版修订说明\r\n保留 CRLF 写法"
+        status, body = self.patch(self.second["id"], {
+            "description": new_description,
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.second["id"])
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["description"], new_description)
+
+        tracks = self.list_tracks()
+        # 记录数量与列表顺序不变，仍是各自独立的三条。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.first["id"], self.second["id"], self.third["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.second["id"]), body)
+        # 其他版本的完整资料不受影响。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.third["id"]), self.third)
+
+    def test_clear_or_blank_description_on_one_version_isolated(self):
+        # 在其中一个版本上清空或改成纯空白说明，也不波及同来源的其他版本。
+        status, body = self.patch(self.first["id"], {"description": None})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], "")
+        status, body = self.patch(self.third["id"], {"description": " \r\n "})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], " \r\n ")
+
+        self.assertEqual(
+            self.track_by_id(self.first["id"])["description"], ""
+        )
+        self.assertEqual(
+            self.track_by_id(self.second["id"])["description"], "重制说明"
+        )
+        self.assertEqual(
+            self.track_by_id(self.third["id"])["description"], " \r\n "
+        )
+
+
+class EditDescriptionInvalidTypeTest(ServerTestCase):
+    """description 误传非字符串类型：400 且 field=description，整单失败。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="原说明\n第二行",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        # 同来源的另一版本与不同来源的无关曲目，用于证明失败不波及其余记录。
+        self.same_source = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            description="同来源版本说明",
+            save_as_new_version=True,
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+            description="不应受影响", tags=["其他"],
+        )
+
+    def assert_description_rejected(self, bad_description):
+        """非法说明（连同合法的新名称、新时长一起提交）必须整单失败。"""
+        status, body = self.patch(self.track_id, {
+            "title": "不应保存的新名称",
+            "duration": 300,
+            "description": bad_description,
+        })
+        self.assertEqual(status, 400, body)
+        # field 指向 description，错误文字明确指出说明类型有误。
+        self.assertEqual(body["field"], "description")
+        self.assertIn("说明", body["error"])
+        self.assertIn("字符串", body["error"])
+
+    def assert_everything_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量与列表顺序不变，没有额外记录。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.same_source["id"], self.bystander["id"]],
+        )
+        # 目标曲目的已保存资料保持提交前内容：同次请求里合法的新名称、
+        # 新时长没有先写入，原说明仍在；其他曲目也不受影响。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        self.assertEqual(
+            self.track_by_id(self.same_source["id"]), self.same_source
+        )
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_numbers_are_rejected(self):
+        for bad in (0, 1, 243, -5, 0.5, 12.8):
+            with self.subTest(bad=bad):
+                self.assert_description_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_booleans_are_rejected(self):
+        for bad in (True, False):
+            with self.subTest(bad=bad):
+                self.assert_description_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_arrays_are_rejected(self):
+        for bad in ([], ["说明"], ["第一行", "第二行"], [1], [None]):
+            with self.subTest(bad=bad):
+                self.assert_description_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_objects_are_rejected(self):
+        for bad in ({}, {"description": "说明"}, {"text": "x"}):
+            with self.subTest(bad=bad):
+                self.assert_description_rejected(bad)
+                self.assert_everything_unchanged()
+
+    def test_invalid_description_alone_is_rejected(self):
+        # 即使同次请求没有夹带其他字段，拒绝规则相同。
+        status, body = self.patch(self.track_id, {"description": 123})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "description")
+        self.assertIn("说明", body["error"])
+        self.assert_everything_unchanged()
+
+    def test_null_clears_instead_of_type_error(self):
+        # null 的清空含义不能被混入数字、布尔、数组、对象的类型错误：
+        # 上面的类型全部 400，而 null 正常 200 并清空说明。
+        status, body = self.patch(self.track_id, {
+            "title": "可以同时保存的新名称",
+            "description": None,
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "可以同时保存的新名称")
+        self.assertEqual(body["description"], "")
+        self.assertEqual(self.track_by_id(self.track_id)["description"], "")
+
+    def test_listing_after_failure_still_shows_original_description(self):
+        # 失败后读取列表应仍看到原说明，而不是本次请求的部分修改：
+        # 先尝试一次夹带合法新名称与非法说明的请求，再直接核对列表。
+        self.assert_description_rejected({"text": "对象不是字符串"})
+        listed = self.track_by_id(self.track_id)
+        self.assertEqual(listed["description"], "原说明\n第二行")
+        self.assertEqual(listed["title"], "夜航")
+        self.assertEqual(listed["duration"], 243.5)
+        self.assertEqual(len(self.list_tracks()), 3)
+        self.assert_everything_unchanged()
 
 
 if __name__ == "__main__":
