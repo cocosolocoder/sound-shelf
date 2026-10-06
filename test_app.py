@@ -136,6 +136,19 @@
   编辑页与曲目列表读到的资料都与本次填写一致。同一来源已有多个版本时，
   来源框不动、只修正一条的名称照常保存成功，不触发来源冲突，其他版本
   的名称与资料保持原样。
+- 编辑页名称框是多行输入框：接口收录的名称允许内部换行（含 LF/CRLF/CR），
+  打开编辑页后名称中的中文、内部空格、连续空行与各行文字都出现在原有位置
+  （“夜航”“空行”“现场  版”三行保持三行），引号、尖括号与形似网页标签的
+  文字按普通文字转义显示，不变成页面元素也不改变名称。只修改时长、说明等
+  其他合法资料时，提交名称在换行归一化（CRLF/CR 归一为 LF）并去掉首尾
+  空白后与原名称相同即视为未修改，原名称逐字节保留，LF/CRLF/CR 写法都不
+  被改写，仅在首尾增删空白同样不算修改内部内容；确实修改名称的文字、空格
+  或分行时按本次填写保存，只去掉整段首尾空白，内部空行与空格保留、换行
+  统一为 LF。保存成功更新原曲目并返回列表，再次打开编辑页与列表接口读到
+  的名称与保存结果一致。名称删空或只剩空格、制表符、换行时返回 400 并在
+  名称旁指出错误，整条曲目不保存任何修改；名称合法而时长等其他字段不合法
+  时仍返回 400 且不写入资料，页面完整保留本次填写的多行名称与其他资料
+  （不被旧值替换、不失去分行），只修正出错字段后再保存采用错误页保留的名称。
 
 运行：python3 -m unittest test_app -v
 """
@@ -172,6 +185,10 @@ DESCRIPTION_RE = re.compile(
 )
 SOURCE_RE = re.compile(
     r'<textarea id="f-source" name="source"[^>]*>(.*?)</textarea>',
+    re.DOTALL,
+)
+TITLE_RE = re.compile(
+    r'<textarea id="f-title" name="title"[^>]*>(.*?)</textarea>',
     re.DOTALL,
 )
 BANNER_ERROR_RE = re.compile(
@@ -247,6 +264,13 @@ def parse_source_box(page):
     """提取来源框在浏览器中呈现的文字（与说明框相同的 HTML 解析规则）。"""
     match = SOURCE_RE.search(page)
     assert match is not None, "页面中找不到来源输入框"
+    return textarea_browser_text(match.group(1))
+
+
+def parse_title_box(page):
+    """提取名称框在浏览器中呈现的文字（与来源框相同的 HTML 解析规则）。"""
+    match = TITLE_RE.search(page)
+    assert match is not None, "页面中找不到名称输入框"
     return textarea_browser_text(match.group(1))
 
 
@@ -533,7 +557,7 @@ class ServerTestCase(unittest.TestCase):
         说明框取浏览器实际呈现的文字，标签逐框连同原始序号隐藏域一起取回。
         """
         fields = [
-            ("title", parse_input_value(page, "title", "title")),
+            ("title", parse_title_box(page)),
             ("source", parse_source_box(page)),
             ("duration", parse_input_value(page, "duration", "duration")),
             ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
@@ -563,7 +587,7 @@ class ServerTestCase(unittest.TestCase):
                            duration=None, cover_url=None, description=None):
         """断言编辑页各普通字段输入框的回填值。"""
         if title is not None:
-            self.assertEqual(parse_input_value(page, "title", "title"), title)
+            self.assertEqual(parse_title_box(page), title)
         if source is not None:
             self.assertEqual(parse_source_box(page), source)
         if duration is not None:
@@ -616,7 +640,7 @@ class ServerTestCase(unittest.TestCase):
         勾选框按当前选中状态还原。
         """
         fields = [
-            ("title", parse_input_value(page, "title", "title")),
+            ("title", parse_title_box(page)),
             ("source", parse_source_box(page)),
             ("duration", parse_input_value(page, "duration", "duration")),
             ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
@@ -2253,6 +2277,391 @@ class EditPageTitleSameSourceVersionsTest(ServerTestCase):
         self.assertEqual(self.track_by_id(self.first["id"]), self.first)
         self.assertEqual(
             [t["id"] for t in self.list_tracks()], self.ordered_ids
+        )
+
+
+class EditPageMultilineTitleRenderTest(ServerTestCase):
+    """打开编辑页：名称框完整还原已保存名称的内部文字、空格与分行。"""
+
+    MULTILINE_TITLE = "夜航\n\n现场  版"
+
+    def test_three_line_title_keeps_blank_line_and_internal_spaces(self):
+        track = self.create_track(title=self.MULTILINE_TITLE, source="/music/yehang.flac")
+        page = self.get_edit_page(track["id"])
+        # 三行保持原有位置：第一行“夜航”、第二行为空、第三行“现场  版”，
+        # 不能被压成“夜航现场  版”。
+        self.assertEqual(parse_title_box(page), self.MULTILINE_TITLE)
+        self.assertNotIn("夜航现场", page)
+        self.assertIn("夜航\n\n现场  版", page)
+
+    def test_crlf_and_cr_titles_render_with_same_lines(self):
+        for index, raw in enumerate(("夜航\r\n\r\n现场  版", "夜航\r现场")):
+            with self.subTest(raw=raw):
+                track = self.create_track(
+                    title=raw, source=f"/music/newline-{index}.flac"
+                )
+                page = self.get_edit_page(track["id"])
+                # 浏览器把 CRLF/CR 都显示为换行：框内呈现相同的行与文字。
+                self.assertEqual(
+                    parse_title_box(page),
+                    raw.replace("\r\n", "\n").replace("\r", "\n"),
+                )
+
+    def test_leading_blank_lines_render_in_box(self):
+        # 接口收录会裁掉名称首尾空白，但库里可能存在以换行开头的旧数据：
+        # 开头空行仍必须还原（HTML 解析会吞掉 textarea 起始标签后的第一个
+        # 换行，页面渲染时已补回）。
+        title = "\n\n开头两个空行\n结尾"
+        track_id = self.server.insert_legacy(title)
+        page = self.get_edit_page(track_id)
+        self.assertEqual(parse_title_box(page), title)
+
+    def test_chinese_internal_spaces_and_trailing_spaces_keep_position(self):
+        title = "第一段 中间两个空格\n 行首空格与行尾空格  \n第三段"
+        track = self.create_track(title=title, source="/music/spaces.flac")
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_title_box(page), title)
+
+    def test_html_looking_title_is_shown_as_plain_text(self):
+        title = '夜航 "引号" <现场>\n<script>alert(1)</script>\n<b>不是加粗</b>'
+        track = self.create_track(title=title, source="/music/html.flac")
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_title_box(page), title)
+        # 标记内部按普通文字转义：引号、尖括号与形似网页标签的文字都不会
+        # 变成页面元素，名称本身也不被改变。
+        match = TITLE_RE.search(page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", match.group(0))
+        self.assertIn("&lt;b&gt;不是加粗&lt;/b&gt;", match.group(0))
+        self.assertIn("&quot;引号&quot;", match.group(0))
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertNotIn("<b>不是加粗</b>", page)
+
+
+class EditPageMultilineTitleUntouchedSaveTest(ServerTestCase):
+    """未改名称（或仅增删首尾空白）只改其他资料：原名称逐字节保留。"""
+
+    LF_TITLE = "夜航\n\n现场  版\n  缩进的一行  \n结尾段"
+    CRLF_TITLE = LF_TITLE.replace("\n", "\r\n")
+    CR_TITLE = "夜航\r现场  版\r第三段"
+
+    def save_via_form(self, track, **changes):
+        """模拟浏览器：打开编辑页，整表取回（textarea 换行按 CRLF 提交）。"""
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = [
+            (name, browser_newlines(value))
+            if name in ("title", "source", "description", "tags")
+            else (name, value)
+            for name, value in fields
+        ]
+        for name, value in changes.items():
+            fields = self.form_with_field(fields, name, value)
+        return self.post_edit_form(track["id"], fields)
+
+    def assert_title_preserved_when_changing_duration(self, title):
+        track = self.create_track(
+            title=title, source="/music/yehang.flac", duration=120,
+            description="原始说明",
+        )
+        status, _, page = self.save_via_form(track, duration="243.5")
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["duration"], 243.5)
+        # 原名称逐字节保留：换行写法不因网页显示与表单提交被改写。
+        self.assertEqual(record["title"], title)
+        return record
+
+    def test_lf_title_survives_browser_crlf_submission(self):
+        record = self.assert_title_preserved_when_changing_duration(self.LF_TITLE)
+        self.assertNotIn("\r", record["title"])
+
+    def test_crlf_title_survives_browser_crlf_submission(self):
+        record = self.assert_title_preserved_when_changing_duration(self.CRLF_TITLE)
+        self.assertIn("\r\n", record["title"])
+
+    def test_cr_title_survives_browser_crlf_submission(self):
+        record = self.assert_title_preserved_when_changing_duration(self.CR_TITLE)
+        self.assertIn("\r", record["title"])
+        self.assertNotIn("\r\n", record["title"])
+
+    def test_repeated_resaves_keep_title_stable(self):
+        track = self.create_track(
+            title=self.CRLF_TITLE, source="/music/yehang.flac", duration=1,
+        )
+        for round_index in range(2):
+            status, _, page = self.save_via_form(
+                self.track_by_id(track["id"]), duration=str(10 + round_index),
+            )
+            self.assertEqual(status, 303, page[:500])
+            self.assertEqual(
+                self.track_by_id(track["id"])["title"], self.CRLF_TITLE
+            )
+
+    def test_surrounding_whitespace_only_counts_as_untouched(self):
+        track = self.create_track(
+            title=self.CRLF_TITLE, source="/music/yehang.flac", duration=1,
+        )
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        # 用户只在名称首尾增删空白（含换行），内部一字未动。
+        padded = "  \r\n" + browser_newlines(self.LF_TITLE) + "\t \r\n"
+        fields = self.form_with_field(fields, "title", padded)
+        fields = self.form_with_field(fields, "duration", "240")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        # 仍保留原名称的完整文字，不按去掉首尾空白后的文字重写。
+        self.assertEqual(self.track_by_id(track["id"])["title"], self.CRLF_TITLE)
+
+    def test_newline_style_variants_stay_two_distinct_titles(self):
+        # 两个曲目名称只在内部换行写法上不同：各自保留，打开编辑页再保存
+        # 不会把它们变成同一段名称。
+        lf_track = self.create_track(title="甲\n乙", source="/music/a.flac")
+        crlf_track = self.create_track(title="甲\r\n乙", source="/music/b.flac")
+
+        status, _, page = self.save_via_form(lf_track, duration="11")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(lf_track["id"])["title"], "甲\n乙")
+        self.assertEqual(self.track_by_id(crlf_track["id"])["title"], "甲\r\n乙")
+
+        status, _, page = self.save_via_form(crlf_track, duration="22")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(lf_track["id"])["title"], "甲\n乙")
+        self.assertEqual(self.track_by_id(crlf_track["id"])["title"], "甲\r\n乙")
+
+    def test_same_source_versions_edit_independently(self):
+        # 同一来源的多个版本：只改其中一条的时长，它的多行名称与另一版本
+        # 的名称都保持原样。
+        first = self.create_track(
+            title=self.LF_TITLE, source="/music/yehang.flac", duration=100,
+        )
+        second = self.create_track(
+            title=self.CRLF_TITLE, source="/music/yehang.flac", duration=200,
+            save_as_new_version=True,
+        )
+        status, _, page = self.save_via_form(second, duration="240")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(second["id"])["title"], self.CRLF_TITLE)
+        self.assertEqual(self.track_by_id(first["id"]), first)
+        self.assertEqual(len(self.list_tracks()), 2)
+
+    def test_saved_title_matches_listing_api_and_reopen(self):
+        track = self.create_track(
+            title=self.CRLF_TITLE, source="/music/yehang.flac", duration=120,
+        )
+        status, headers, _ = self.save_via_form(track, duration="300")
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track['id']}&edited=1"
+        )
+        # 曲目列表接口读到的名称与保存结果（原文）一致。
+        self.assertEqual(
+            self.track_by_id(track["id"])["title"], self.CRLF_TITLE
+        )
+        # 再次打开编辑页，三行与内部空格仍在原有位置。
+        self.assertEqual(
+            parse_title_box(self.get_edit_page(track["id"])),
+            self.CRLF_TITLE.replace("\r\n", "\n"),
+        )
+
+
+class EditPageMultilineTitleChangesTest(ServerTestCase):
+    """确实修改名称内部文字、空格或分行：按本次填写（LF）去首尾空白保存。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="旧名称", source="/music/yehang.flac", duration=120,
+        )
+        self.track_id = self.track["id"]
+
+    def submit_title(self, title_text, **changes):
+        page = self.get_edit_page(self.track_id)
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "title", title_text)
+        for name, value in changes.items():
+            fields = self.form_with_field(fields, name, value)
+        return self.post_edit_form(self.track_id, fields)
+
+    def test_edited_title_saved_with_lf_newlines_and_trimmed(self):
+        typed = "  夜航\r\n\r\n现场  版\r\n 段落之间保留空行  \r\n最后一行\r\n "
+        status, headers, page = self.submit_title(typed)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={self.track_id}&edited=1"
+        )
+        # 内部换行统一为 LF，整段首尾空白去掉，内部空行、行内与行尾空格保留。
+        saved = "夜航\n\n现场  版\n 段落之间保留空行  \n最后一行"
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], saved)
+        self.assertNotIn("\r", record["title"])
+        # 接口随后读到的名称与保存结果一致，标识不变、不新增记录。
+        self.assertEqual(record["id"], self.track_id)
+        self.assertEqual(len(self.list_tracks()), 1)
+        # 重新打开编辑页，名称框呈现保存后的完整文字与空行。
+        self.assertEqual(parse_title_box(self.get_edit_page(self.track_id)), saved)
+
+    def test_change_line_breaks_only_saves_lf_version(self):
+        # 用户只调整分行（把单行名称改成三行）也属于修改，按本次填写保存。
+        status, _, page = self.submit_title("夜航\r\n\r\n现场  版")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(self.track_id)["title"], "夜航\n\n现场  版"
+        )
+
+    def test_other_fields_saved_along_with_multiline_title(self):
+        typed = "夜航\n（现场版）"
+        status, _, page = self.submit_title(
+            typed, duration="243.5", description="新说明\n第二行",
+        )
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], "夜航\n（现场版）")
+        self.assertEqual(record["duration"], 243.5)
+        self.assertEqual(record["description"], "新说明\n第二行")
+
+
+class EditPageMultilineTitleRequiredTest(ServerTestCase):
+    """多行名称删空或只剩空格、制表符、换行：400 且不保存任何修改。"""
+
+    MULTILINE_TITLE = "夜航\n\n现场  版"
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title=self.MULTILINE_TITLE,
+            source="/music/yehang.flac",
+            duration=212,
+            description="原始说明",
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=7,
+        )
+
+    def test_blank_and_newline_only_titles_are_rejected(self):
+        for typed in ("", "   ", "\t", "\n", "\r\n", "  \t\r\n \n "):
+            with self.subTest(typed=repr(typed)):
+                fields = self.edit_form_fields(
+                    title=typed,
+                    source="/music/yehang.flac",
+                    duration="243.5",
+                    description="打算改成的新说明",
+                )
+                status, _, page = self.post_edit_form(self.track_id, fields)
+                self.assertEqual(status, 400)
+                banner = BANNER_ERROR_RE.search(page)
+                self.assertIsNotNone(banner)
+                self.assertIn("名称", strip_tags(banner.group(1)))
+                field_errors = [
+                    strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)
+                ]
+                self.assertTrue(any("名称" in text for text in field_errors))
+                # 整条曲目不保存任何修改：名称仍是原来的三行，其他资料也不变。
+                self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+    def test_failure_page_reprints_multiline_submission(self):
+        # 只剩空格、制表符与换行（占了四行）仍不合法：错误页名称框逐行
+        # 保留本次填写的空白原文，不被原记录名称覆盖。
+        typed = "  \r\n\r\n\t \r\n "
+        fields = self.edit_form_fields(
+            title=typed,
+            source="/music/yehang.flac",
+            duration="243.5",
+            description="新说明",
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(parse_title_box(page), "  \n\n\t \n ")
+        self.assert_form_values(page, duration="243.5")
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+
+class EditPageMultilineTitleDurationFailureTest(ServerTestCase):
+    """时长不合法导致保存失败：多行名称完整回填，只修正时长后采用回填名称。"""
+
+    MULTILINE_TITLE = "夜航\n\n现场  版"
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title=self.MULTILINE_TITLE,
+            source="/music/yehang.flac",
+            duration=212,
+            description="原始说明\n第二行",
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=7,
+        )
+
+    def test_untouched_multiline_title_survives_failure_and_retry(self):
+        # 用户没碰名称框（框内文字按 CRLF 提交），只把时长填成负数。
+        page = self.get_edit_page(self.track_id)
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "duration", "-5")
+        fields = [
+            (name, browser_newlines(value))
+            if name in ("title", "source", "description", "tags")
+            else (name, value)
+            for name, value in fields
+        ]
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        # 整条记录保持原样；名称框回填本次提交的文字（LF 呈现，三行都在）。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        self.assertEqual(parse_title_box(page), self.MULTILINE_TITLE)
+        self.assert_form_values(page, duration="-5")
+
+        # 只修正时长后继续保存：未改名称仍保留原 LF 原文。
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "duration", "240")
+        fields = [
+            (name, browser_newlines(value))
+            if name in ("title", "source", "description", "tags")
+            else (name, value)
+            for name, value in fields
+        ]
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], self.MULTILINE_TITLE)
+        self.assertEqual(record["duration"], 240)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_modified_multiline_title_reprinted_and_saved_on_retry(self):
+        # 用户把名称改成新的多行文字，同时把时长填成非法文字。
+        page = self.get_edit_page(self.track_id)
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(
+            fields, "title", "夜航\r\n\r\n现场  版（2026 重制）"
+        )
+        fields = self.form_with_field(fields, "duration", "abc")
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 改过的多行名称按本次填写回填（LF 呈现），不能被旧名称替换。
+        self.assertEqual(
+            parse_title_box(page), "夜航\n\n现场  版（2026 重制）"
+        )
+
+        # 只修正时长后保存：采用错误页中保留的名称（换行统一为 LF）。
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "duration", "240")
+        fields = [
+            (name, browser_newlines(value))
+            if name in ("title", "source", "description", "tags")
+            else (name, value)
+            for name, value in fields
+        ]
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record["title"], "夜航\n\n现场  版（2026 重制）")
+        self.assertEqual(record["duration"], 240)
+        # 再次打开编辑页看到的名称与曲目列表接口一致。
+        self.assertEqual(
+            parse_title_box(self.get_edit_page(self.track_id)),
+            record["title"],
         )
 
 
