@@ -430,6 +430,11 @@ def render_track_form(form, error, error_field, *, action, submit_label,
     # 吞掉的第一个换行），框高随实际行数自适应。
     source_text = form.get("source", "")
     source_rows = min(max(1, source_text.count("\n") + 1), 10)
+    # 封面地址同样按一段文字保存，内部换行与空格都是地址的一部分：用多行
+    # 输入框完整呈现已保存地址（含开头空行，由 textarea_content 抵消 HTML
+    # 解析吞掉的第一个换行），框高随实际行数自适应。
+    cover_text = form.get("cover_url", "")
+    cover_rows = min(max(1, len(re.findall(r"\r\n|\r|\n", cover_text)) + 1), 10)
 
     if edit_mode:
         # 编辑页每个标签项一个独立输入框：标签文字内部的换行保留在
@@ -490,8 +495,8 @@ def render_track_form(form, error, error_field, *, action, submit_label,
   <label for="f-duration">时长 <span class="hint">（秒，可留空表示未知；允许 0 和小数）</span></label>
   <input type="text" id="f-duration" name="duration" inputmode="decimal" value="{value("duration")}">
   {inline_error("duration")}
-  <label for="f-cover-url">封面地址 <span class="hint">（可留空，不会检查远端文件）</span></label>
-  <input type="text" id="f-cover-url" name="cover_url" value="{value("cover_url")}">
+  <label for="f-cover-url">封面地址 <span class="hint">（可留空，不会检查远端文件；可在框内换行写成多行，按文字原样保存，只裁掉首尾空白，内部换行与空格都会保留）</span></label>
+  <textarea id="f-cover-url" name="cover_url" class="cover-box" rows="{cover_rows}">{textarea_content(cover_text)}</textarea>
   {inline_error("cover_url")}
   <label for="f-description">说明 <span class="hint">（可留空，保留换行）</span></label>
   <textarea id="f-description" name="description">{textarea_content(form.get("description", ""))}</textarea>
@@ -606,6 +611,7 @@ form.track-form input[type=text],form.track-form textarea{{width:100%;box-sizing
 form.track-form textarea{{min-height:5.5rem;resize:vertical}}
 form.track-form textarea.source-box{{min-height:2.4rem}}
 form.track-form textarea.title-box{{min-height:2.4rem}}
+form.track-form textarea.cover-box{{min-height:2.4rem}}
 .field-error{{color:#b3261e;margin:.25rem 0 0;font-size:.92em}}
 form.track-form button{{margin-top:1.1rem;padding:.5rem 1.2rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#1769aa;color:#fff;cursor:pointer}}
 .form-cancel{{margin:.6rem 0 0;font-size:.95em}}
@@ -852,7 +858,11 @@ def form_to_payload(form, *, edit_mode=False):
         # 调用方再据此判断用户是否真的改过来源。
         "source": normalize_newlines(one("source")),
         "duration": duration,
-        "cover_url": one("cover_url"),
+        # 封面地址框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
+        # LF，使网页填写的地址与接口按文字收录的同一段地址一致；编辑时
+        # 调用方再据此判断用户是否真的改过封面地址。直接打接口提交的换行
+        # 不经过这里，保持各自的 LF/CRLF/CR 写法。
+        "cover_url": normalize_newlines(one("cover_url")),
         "description": description,
         "tags": tags,
         "save_as_new_version": one("save_as_new_version") in ("1", "on", "true", "yes"),
@@ -923,6 +933,9 @@ def main():
             # 失败重绘时按 LF 回填名称框（浏览器以 CRLF 提交框内换行），
             # 名称中的内部换行与空格按本次填写完整保留。
             form_view["title"] = normalize_newlines(form_view["title"])
+            # 封面地址框同样按本次填写（换行归一化为 LF）完整回填，
+            # 内部空行、空格与各行文字不因保存失败丢失。
+            form_view["cover_url"] = normalize_newlines(form_view["cover_url"])
             form_view["save_as_new_version"] = (
                 form.get("save_as_new_version", [""])[0] in ("1", "on", "true", "yes")
             )
@@ -1019,6 +1032,9 @@ def main():
             # 首尾空格都按本次填写完整保留。
             form_view["title"] = normalize_newlines(form_view["title"])
             form_view["source"] = normalize_newlines(form_view["source"])
+            # 失败重绘时封面地址框也按本次填写（换行归一化为 LF）完整回填，
+            # 地址的内部换行、连续空行与空格都不丢失、不换回旧值。
+            form_view["cover_url"] = normalize_newlines(form_view["cover_url"])
             form_view["description"] = normalize_newlines(
                 form_view["description"]
             )
@@ -1053,6 +1069,17 @@ def main():
                 # 只裁整段首尾空白，说明完整保留。
                 omit_unchanged_edit_field(
                     payload, "title", record["title"], trim_outer=True
+                )
+                # 封面地址与名称共用同一判断（换行归一化、去掉整段首尾空白后
+                # 比较）：用户没改地址内部内容（只改其他合法资料，或只给首尾
+                # 增删空白）时不提交该字段，由 update_track 的“未提交保留旧值”
+                # 语义逐字节保留原地址——LF/CRLF/CR 换行写法不被网页显示与
+                # 提交的写法差异改写；确实修改地址内部的文字、空格或分行时才
+                # 按本次填写保存，整段首尾空白沿用 clean_cover_url_value 的裁剪
+                # 规则，内部空行与空格保留，网页此次修改的换行统一为 LF，
+                # 主动删空或只剩空白则保存为空字符串。
+                omit_unchanged_edit_field(
+                    payload, "cover_url", record["cover_url"], trim_outer=True
                 )
                 omit_unchanged_edit_field(
                     payload, "description", record["description"],
