@@ -755,6 +755,36 @@ def reconcile_edit_tags(submitted, refs, originals):
     return final
 
 
+def drop_unchanged_text(payload, record, field, *, trim):
+    """编辑页提交的文本字段若未实际改动，就从 payload 移除以保留原文。
+
+    浏览器会把框内换行统一成 CRLF 提交，form_to_payload 已把提交文字
+    归一化为 LF；这里把原始文字同样归一化后再比较，因此原文使用
+    LF/CRLF/CR 的写法差异都不算改动，原文字逐字节保留。留在 payload
+    中的字段才是用户确实改过的，按本次填写（换行统一为 LF）保存。
+
+    各字段的空白规则不同，由 trim 区分：trim=True（名称、来源）比较前
+    再去掉整段首尾空白，仅在首尾增删空白不算改动；trim=False（说明）
+    的首尾空白是内容本身，空字符串与纯空白说明互不相同，只有换行写法
+    的差异不算改动。
+
+    旧记录的来源可能缺失（None）：提交内容去掉首尾空白后为空视为仍未
+    填写，继续保持缺失状态、不参与判重；填了内容则按本次填写保存。
+    """
+    original = record[field]
+    if original is None:
+        if not payload[field].strip():
+            del payload[field]
+        return
+    submitted = payload[field]
+    if trim:
+        unchanged = submitted.strip() == normalize_newlines(original).strip()
+    else:
+        unchanged = submitted == normalize_newlines(original)
+    if unchanged:
+        del payload[field]
+
+
 def form_to_payload(form, *, edit_mode=False):
     """把 application/x-www-form-urlencoded 表单转成校验器接受的字典。
 
@@ -781,8 +811,9 @@ def form_to_payload(form, *, edit_mode=False):
         # 每个同名字段对应编辑页的一个标签输入框，字段内部的换行原样保留；
         # 浏览器按 CRLF 提交，统一归一化为 LF，使保存结果与接口原文收录一致。
         tags = [normalize_newlines(part) for part in form.get("tags", [])]
-        # 说明框同样会被浏览器按 CRLF 提交：先归一化为 LF，调用方再据此
-        # 判断用户是否真的改过说明，改了才按本次文字（LF 换行）保存。
+        # 说明框同样会被浏览器按 CRLF 提交：先归一化为 LF，保存时由
+        # drop_unchanged_text 据此判断用户是否真的改过说明，改了才按
+        # 本次文字（LF 换行）保存。
         description = normalize_newlines(one("description"))
     else:
         tags = [part for part in re.split(r"[,，、]+", one("tags"))]
@@ -790,12 +821,12 @@ def form_to_payload(form, *, edit_mode=False):
 
     payload = {
         # 名称框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
-        # LF，使网页填写的名称与接口按文字收录的同一段名称一致；编辑时
-        # 调用方再据此判断用户是否真的改过名称。
+        # LF，使网页填写的名称与接口按文字收录的同一段名称一致；编辑时由
+        # drop_unchanged_text 据此判断用户是否真的改过名称。
         "title": normalize_newlines(one("title")),
         # 来源框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
-        # LF，使网页填写的来源与接口按文字收录的同一段来源一致；编辑时
-        # 调用方再据此判断用户是否真的改过来源。
+        # LF，使网页填写的来源与接口按文字收录的同一段来源一致；编辑时由
+        # drop_unchanged_text 据此判断用户是否真的改过来源。
         "source": normalize_newlines(one("source")),
         "duration": duration,
         "cover_url": one("cover_url"),
@@ -988,38 +1019,14 @@ def main():
                 payload["tags"] = reconcile_edit_tags(
                     submitted_tags, submitted_refs, record["tags"]
                 )
-                # 用户没有改动名称时（提交文字去掉首尾空白、换行归一化后
-                # 与原名称一致），不提交该字段：原名称逐字节保留，原文使用
-                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
-                # 被改写，仅内部换行写法不同的两段名称也不会因此变成同一
-                # 段；仅在名称首尾增删空白沿用现有裁剪规则，同样不算改动
-                # 内部内容。确实修改名称内部的文字、空格或分行时才按本次
-                # 填写（换行统一为 LF）去掉首尾空白保存。
-                if (payload["title"].strip()
-                        == normalize_newlines(record["title"]).strip()):
-                    del payload["title"]
-                # 用户没有修改说明时（提交文字在换行归一化后与原说明一致），
-                # 不提交该字段：原说明逐字节保留，LF/CRLF 写法、首尾空白、
-                # 空串与纯空白说明的区别都不因本次保存被改写；确实改了说明
-                # 时才按本次填写保存（换行统一为 LF）。
-                if payload["description"] == normalize_newlines(
-                    record["description"]
-                ):
-                    del payload["description"]
-                # 用户没有改动来源时（提交文字去掉首尾空白、换行归一化后
-                # 与原来源一致），不提交该字段：原来源逐字节保留，原文使用
-                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
-                # 被改写，仅内部换行写法不同的两段来源也不会因此变成同一
-                # 段；确实修改来源内部的文字、空格或分行时才按本次填写
-                # （换行统一为 LF）去掉首尾空白保存并参与判重。
-                # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
-                # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
-                if record["source"] is None:
-                    if not payload["source"].strip():
-                        del payload["source"]
-                elif (payload["source"].strip()
-                      == normalize_newlines(record["source"]).strip()):
-                    del payload["source"]
+                # 名称、来源、说明共用同一套“未改动则保留原文”的判断：
+                # 浏览器统一换行后的提交不算改动，各字段不同的空白规则
+                # （名称与来源去掉整段首尾空白后比较，说明逐字比较）与
+                # 旧记录来源缺失的情形都由 drop_unchanged_text 处理；
+                # 确实改过的字段按本次填写（换行统一为 LF）保存。
+                drop_unchanged_text(payload, record, "title", trim=True)
+                drop_unchanged_text(payload, record, "description", trim=False)
+                drop_unchanged_text(payload, record, "source", trim=True)
                 updated, conflicts = update_track(database, track_id, payload)
             except PayloadError as exc:
                 self.error_page(
