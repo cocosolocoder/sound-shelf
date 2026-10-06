@@ -110,6 +110,18 @@
   即使同次改了合法的名称或说明也整单失败，目标记录与其他曲目保持
   提交前状态，页面回填本次填写的全部内容；只修正时长再保存时，本次
   表单里的合法修改与时长一起写入，不会换回旧值。
+- 编辑页名称（GET/POST /tracks/{id}/edit）：名称删空或只留空格、制表符
+  时返回 400，页面与名称框旁都指出名称有误，不出现修改成功；无论来源
+  保持原样还是改成尚未占用的来源，失败提示都指向名称。该曲目标识与全部
+  已保存资料仍是提交前的内容，其他记录、数量与顺序不变；页面回填本次
+  填写的名称、来源、时长、封面、说明与各个标签框（说明的中文、首尾空格
+  与空行，标签项内的换行与逗号按各自输入边界保留，形似网页标签的文字
+  仍是普通文字），不用原记录覆盖。只补上合法名称再保存时 303 回列表并
+  显示修改成功与最新资料：名称只去掉首尾空白，中文、内部空格与标点保留，
+  失败前填写的合法修改随名称一起保存，标识不变、不新增记录，重新打开
+  编辑页与曲目列表读到的资料都与本次填写一致。同一来源已有多个版本时，
+  来源框不动、只修正一条的名称照常保存成功，不触发来源冲突，其他版本
+  的名称与资料保持原样。
 
 运行：python3 -m unittest test_app -v
 """
@@ -1918,6 +1930,307 @@ class EditPageDurationRetryAfterFailureTest(ServerTestCase):
         self.assertEqual(record["title"], "只改了名称的尝试")
         self.assertEqual(record["duration"], 0)
         self.assertEqual(record["description"], "原始说明\n第二行：鸟鸣")
+
+
+class EditPageTitleRequiredTest(ServerTestCase):
+    """编辑页名称删空或只剩空白：400 并指出名称有误，整次修改被拒绝。"""
+
+    NEW_DESCRIPTION = (
+        "\n第一段说明：清晨录音，中文与标点保留\n\n"
+        "  第二行首尾留空格  \n结尾空行在下一行\n"
+    )
+    NEW_TAGS = ["自然，雨声、溪流", "多行标签\n第二行", "现场"]
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="原始说明\n第二行：鸟鸣",
+            tags=["纯音乐", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=33.3,
+        )
+
+    def blank_title_fields(self, typed_title, *, source="/music/shanjian-v2.flac"):
+        """名称删空/留白，其余资料都改成合法的新内容（换行按浏览器 CRLF）。"""
+        return self.edit_form_fields(
+            title=typed_title,
+            source=source,
+            duration="243.5",
+            cover_url="https://img.example/new.png",
+            description=self.NEW_DESCRIPTION.replace("\n", "\r\n"),
+            tags=[tag.replace("\n", "\r\n") for tag in self.NEW_TAGS],
+        )
+
+    def assert_title_error_shown(self, page):
+        # 页面明确指出名称有误，名称框旁也有对应提示，且不出现修改成功。
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner, "页面上应显示保存失败提示")
+        self.assertIn("名称", strip_tags(banner.group(1)))
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(
+            any("名称" in text for text in field_errors),
+            f"名称字段旁应显示错误，实际：{field_errors}",
+        )
+        self.assertIsNone(
+            BANNER_SUCCESS_RE.search(page), "名称错误时不应出现修改成功"
+        )
+
+    def assert_library_unchanged(self):
+        # 该曲目标识与全部已保存资料仍是提交前的内容；
+        # 其他记录、数量与顺序都不变。
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], [self.track_id, self.bystander["id"]]
+        )
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_empty_title_with_valid_changes_returns_400(self):
+        # 用户从列表打开编辑页，删除名称，同时把其他资料改成合法的新内容。
+        status, _, page = self.post_edit_form(
+            self.track_id, self.blank_title_fields("")
+        )
+        self.assertEqual(status, 400)
+        self.assert_title_error_shown(page)
+        self.assert_library_unchanged()
+        # 错误页的曲目列表里该曲目仍显示提交前的名称。
+        self.assertEqual(parse_listed_tracks(page), [
+            (self.track_id, "山涧晨曲"),
+            (self.bystander["id"], "无关曲目"),
+        ])
+
+    def test_whitespace_only_titles_are_rejected(self):
+        # 只留空格、制表符及其组合同样被拒绝；来源保持原样时也一样。
+        for typed in (" ", "\t", "  \t "):
+            with self.subTest(typed=repr(typed)):
+                status, _, page = self.post_edit_form(
+                    self.track_id,
+                    self.blank_title_fields(
+                        typed, source="/music/shanjian.flac"
+                    ),
+                )
+                self.assertEqual(status, 400)
+                self.assert_title_error_shown(page)
+                self.assert_library_unchanged()
+
+    def test_error_points_at_title_whether_source_kept_or_changed(self):
+        # 来源保持原样、或改成尚未被占用的来源，失败提示都指出名称问题，
+        # 而不是来源冲突。
+        for source in ("/music/shanjian.flac", "/music/shanjian-v2.flac"):
+            with self.subTest(source=source):
+                status, _, page = self.post_edit_form(
+                    self.track_id, self.blank_title_fields("", source=source)
+                )
+                self.assertEqual(status, 400)
+                self.assert_title_error_shown(page)
+                self.assertIsNone(CONFLICT_BANNER_RE.search(page))
+                self.assert_library_unchanged()
+
+    def test_failure_page_reprints_submission_not_original_record(self):
+        status, _, page = self.post_edit_form(
+            self.track_id, self.blank_title_fields("  \t ")
+        )
+        self.assertEqual(status, 400)
+        self.assert_title_error_shown(page)
+
+        # 名称框保留本次填写的空白原文，不被原记录的名称覆盖；
+        # 来源、时长、封面也都回填本次填写的新内容。
+        self.assert_form_values(
+            page,
+            title="  \t ",
+            source="/music/shanjian-v2.flac",
+            duration="243.5",
+            cover_url="https://img.example/new.png",
+        )
+        # 说明框按本次填写还原：中文、开头空行、段落空行与首尾空格都在。
+        self.assertEqual(parse_description_box(page), self.NEW_DESCRIPTION)
+        # 每个标签框保留本次填写：项内换行与逗号、顿号按各自输入边界
+        # 原样保留，末尾附一个空框。
+        self.assert_tag_boxes(page, self.NEW_TAGS + [""])
+        self.assert_library_unchanged()
+
+    def test_html_looking_text_stays_plain_text_in_reprint(self):
+        description = "说明里的 <b>加粗</b> 与 <em>斜体</em> 都是普通文字"
+        tags = ["<script>alert(1)</script>", "正常，标签"]
+        fields = self.edit_form_fields(
+            title="",
+            source="/music/shanjian.flac",
+            duration="243.5",
+            description=description,
+            tags=tags,
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        self.assert_title_error_shown(page)
+
+        # 形似网页标签的文字按普通文字转义显示，不会变成页面元素。
+        self.assertNotIn("<b>加粗</b>", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("&lt;b&gt;加粗&lt;/b&gt;", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        # 框内读回仍是用户填写的原文。
+        self.assertEqual(parse_description_box(page), description)
+        self.assert_tag_boxes(page, tags + [""])
+        self.assert_library_unchanged()
+
+
+class EditPageTitleRetryAfterFailureTest(ServerTestCase):
+    """名称错误页上只补一个合法名称再保存：回填的合法修改随名称一起写入。"""
+
+    NEW_DESCRIPTION = (
+        "\n定稿说明：清晨录音，中文与标点保留\n\n"
+        "  第二行首尾留空格  \n结尾空行在下一行\n"
+    )
+    NEW_TAGS = ["自然，雨声、溪流", "多行标签\n第二行", "现场"]
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="原始说明\n第二行：鸟鸣",
+            tags=["纯音乐", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=7,
+        )
+
+    def submit_blank_title_form(self):
+        """第一次保存：名称删空，其余资料都改成合法的新内容，被 400 拒绝。"""
+        fields = self.edit_form_fields(
+            title="",
+            source="/music/shanjian-v2.flac",
+            duration="243.5",
+            cover_url="https://img.example/new.png",
+            description=self.NEW_DESCRIPTION.replace("\n", "\r\n"),
+            tags=[tag.replace("\n", "\r\n") for tag in self.NEW_TAGS],
+        )
+        status, _, page = self.post_edit_form(self.track_id, fields)
+        self.assertEqual(status, 400)
+        # 失败没有写入任何资料。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        return page
+
+    def test_fix_only_title_saves_reprinted_metadata(self):
+        failed_page = self.submit_blank_title_form()
+
+        # 用户在错误页只补上一个合法名称（首尾带空白，检验只裁剪首尾；
+        # 中文、内部空格与标点应保留），其余回填内容原样再次提交。
+        retry_fields = self.edit_fields_from_rendered_page(failed_page)
+        retry_fields = self.form_with_field(
+            retry_fields, "title", "  山涧晨曲 · 定稿（2026）  "
+        )
+        retry_fields = [
+            (name, value.replace("\n", "\r\n"))
+            if name in ("description", "tags") else (name, value)
+            for name, value in retry_fields
+        ]
+        location, listing_page = self.submit_edit_form_and_open_listing(
+            self.track_id, retry_fields
+        )
+        self.assertEqual(location, f"/?highlight={self.track_id}&edited=1")
+
+        # 回到曲目列表，显示修改成功与这条曲目的最新资料。
+        success = strip_tags(BANNER_SUCCESS_RE.search(listing_page).group(1))
+        self.assertIn("修改成功", success)
+        self.assertIn(f"#{self.track_id}", success)
+        self.assertEqual(parse_listed_tracks(listing_page), [
+            (self.track_id, "山涧晨曲 · 定稿（2026）"),
+            (self.bystander["id"], "无关曲目"),
+        ])
+
+        # 名称只去掉首尾空白；失败前那次填写中合法的修改（来源、时长、
+        # 封面、说明、标签）随修正后的名称一起保存。
+        record = self.track_by_id(self.track_id)
+        self.assertEqual(record, {
+            "id": self.track_id,
+            "title": "山涧晨曲 · 定稿（2026）",
+            "source": "/music/shanjian-v2.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/new.png",
+            "description": self.NEW_DESCRIPTION,
+            "tags": self.NEW_TAGS,
+        })
+        # 成功更新原标识，不新建另一条曲目；其他曲目不受影响。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.track_id, self.bystander["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+        # 重新打开编辑页，各字段与这次填写一致。
+        reopened = self.get_edit_page(self.track_id)
+        self.assert_form_values(
+            reopened,
+            title="山涧晨曲 · 定稿（2026）",
+            source="/music/shanjian-v2.flac",
+            duration="243.5",
+            cover_url="https://img.example/new.png",
+        )
+        self.assertEqual(parse_description_box(reopened), self.NEW_DESCRIPTION)
+        self.assert_tag_boxes(reopened, self.NEW_TAGS + [""])
+
+
+class EditPageTitleSameSourceVersionsTest(ServerTestCase):
+    """同一来源已有多个版本：来源框不动、只修正一条的名称，保存照常成功。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            description="首版说明",
+            tags=["民谣"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            description="重制说明",
+            tags=["重制"],
+            save_as_new_version=True,
+        )
+        self.ordered_ids = [self.first["id"], self.second["id"]]
+
+    def test_rename_one_version_without_touching_source_succeeds(self):
+        # 打开第二个版本的编辑页，来源框保持原样，只修正名称。
+        page = self.get_edit_page(self.second["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "title", "夜航·重制（更名）")
+        location, listing_page = self.submit_edit_form_and_open_listing(
+            self.second["id"], fields
+        )
+        self.assertEqual(location, f"/?highlight={self.second['id']}&edited=1")
+        # 同来源本身不能让保存变成来源冲突：没有冲突横幅，直接修改成功。
+        self.assertIsNone(CONFLICT_BANNER_RE.search(listing_page))
+        success = strip_tags(BANNER_SUCCESS_RE.search(listing_page).group(1))
+        self.assertIn("修改成功", success)
+        self.assertEqual(parse_listed_tracks(listing_page), [
+            (self.first["id"], "夜航·首版"),
+            (self.second["id"], "夜航·重制（更名）"),
+        ])
+
+        # 只有这条的名称改变，来源不变；另一版本的名称与资料保持原样。
+        record = self.track_by_id(self.second["id"])
+        self.assertEqual(record["title"], "夜航·重制（更名）")
+        self.assertEqual(record["source"], "/music/yehang.flac")
+        self.assertEqual(record["duration"], 250)
+        self.assertEqual(record["description"], "重制说明")
+        self.assertEqual(record["tags"], ["重制"])
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()], self.ordered_ids
+        )
 
 
 class EditPageTagBoxesTest(ServerTestCase):
