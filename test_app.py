@@ -25,6 +25,20 @@
   收录，只有首尾空白被去掉，内部文字与标点原样保留；成功返回 201，
   响应记录与随后列表读到的记录一致；省略选填资料仍按时长未知、封面和
   说明为空、标签为空数组保存。
+- 收录接口的时长（POST /api/tracks 的 duration）：名称和来源合法、来源
+  尚未收录时，有限的非负整数与小数都能作为秒数保存，成功返回 201 与完整
+  曲目，0 是已知时长（读回为数字 0，不能当成未知）；省略时长或明确提交
+  null 才表示未知，成功记录中的时长为 null。随后读取曲目列表，在同一标识
+  下读到同一秒数或未知状态，名称、来源与本次提交的其他合法资料一致；列表
+  仍按标识升序，新增曲目不改变已有曲目的资料。时长为负数或非有限数值，或
+  以字符串、布尔值、数组、对象提交时返回 400，field 指向 duration，文字
+  说明时长有误；数字字符串即使看起来像合法秒数也不自动转换，false 不能
+  变成 0（网页允许在输入框里填写数字文字，并不改变 JSON 接口对数字类型的
+  要求）；其他资料都合法也不能保存部分内容：空曲库仍为空，已有曲库的记录
+  数量、顺序与各条完整资料保持提交前状态，不留下只有名称或来源的残缺记录。
+  同一来源明确另存新版本时遵守相同时长规则：合法时长随本次资料保存到新
+  标识下，原版本的时长与其他资料保持原样；时长不合法时即使已明确同意另存，
+  也报告时长错误，不新增版本、不覆盖旧曲目。
 - 首页手动收录表单的名称或来源留空、只填空白时返回 400：页面显示
   失败提示，并在对应字段附近指出错误；回填保留本次填写的名称、来源、
   时长、封面、说明、标签及另存选择，不能用已有记录的资料替换；说明里
@@ -449,6 +463,15 @@ class ServerTestCase(unittest.TestCase):
         status, _, raw = self.server.raw_json(
             "PATCH", f"/api/tracks/{track_id}", raw_text
         )
+        return status, json.loads(raw) if raw else None
+
+    def post_raw(self, raw_text):
+        """发送原始 JSON 文本的 POST（用于 NaN/Infinity 等非标准片段）。
+
+        Python 的 json.loads 接受 NaN/Infinity，因此这些片段到达服务端
+        后应被时长校验拒绝，而不是被当成无效 JSON。
+        """
+        status, _, raw = self.server.raw_json("POST", "/api/tracks", raw_text)
         return status, json.loads(raw) if raw else None
 
     def list_tracks(self):
@@ -4250,6 +4273,506 @@ class CreateRequiredFieldApiWithExistingTest(ServerTestCase):
         )
         self.assertEqual(self.track_by_id(self.first["id"]), self.first)
         self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+
+class CreateDurationValidApiTest(ServerTestCase):
+    """收录接口（POST /api/tracks）：合法时长随本次资料保存，0 与未知分清。
+
+    名称与来源合法、来源尚未收录时：有限的非负整数与小数都能作为秒数
+    保存，成功返回 201 与完整曲目；省略时长或明确提交 null 都表示未知。
+    随后读取曲目列表，同一标识下读到同一秒数或未知状态，名称、来源与
+    本次提交的其他合法资料一致；列表按标识升序，新收录不改变已有曲目。
+    """
+
+    def full_payload(self, source, duration, **overrides):
+        payload = {
+            "title": "夜航·现场收录",
+            "source": source,
+            "duration": duration,
+            "cover_url": "https://img.example/yehang.png",
+            "description": "现场录音\n第二行：中文标点，保留",
+            "tags": ["民谣", "现场", "民谣"],
+        }
+        payload.update(overrides)
+        return payload
+
+    def assert_created_and_listed(self, payload, expected_duration):
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        self.assertIsInstance(body["id"], int)
+        # 成功返回完整曲目：时长为本次秒数，标签按既有规则裁剪去重，
+        # 其余资料全部来自本次提交。
+        self.assertEqual(body, {
+            "id": body["id"],
+            "title": payload["title"],
+            "source": payload["source"],
+            "duration": expected_duration,
+            "cover_url": payload["cover_url"],
+            "description": payload["description"],
+            "tags": ["民谣", "现场"],
+        })
+        # 随后读取曲目列表：同一标识下读到同一时长与整条资料。
+        self.assertEqual(self.track_by_id(body["id"]), body)
+        return body
+
+    def test_integer_seconds_saved_as_integer(self):
+        record = self.assert_created_and_listed(
+            self.full_payload("/music/int-seconds.flac", 307), 307
+        )
+        # 整数值在响应与列表中都按整数呈现，不变成 307.0。
+        self.assertIsInstance(record["duration"], int)
+
+    def test_decimal_seconds_saved_without_rounding_or_conversion(self):
+        # 有限非负小数按秒原样保存，不换算分钟、不四舍五入、不截断成整数。
+        record = self.assert_created_and_listed(
+            self.full_payload("/music/decimal-seconds.flac", 243.5), 243.5
+        )
+        self.assertIsInstance(record["duration"], float)
+
+    def test_small_decimal_seconds_saved(self):
+        for seconds in (0.5, 0.25, 12.75):
+            with self.subTest(seconds=seconds):
+                record = self.assert_created_and_listed(
+                    self.full_payload(
+                        f"/music/decimal-{seconds}.flac", seconds,
+                        title=f"小数秒 {seconds}",
+                    ),
+                    seconds,
+                )
+                self.assertEqual(record["duration"], seconds)
+
+    def test_zero_is_known_duration_not_unknown(self):
+        # 0 是合法的已知时长：读回必须是数字 0，绝不能变成 null。
+        record = self.assert_created_and_listed(
+            self.full_payload(
+                "/music/zero.flac", 0,
+                description="开头静音\n0 秒前奏",
+            ),
+            0,
+        )
+        self.assertEqual(record["duration"], 0)
+        self.assertIsNotNone(record["duration"])
+        self.assertIsInstance(record["duration"], int)
+
+    def test_omitted_duration_saved_as_unknown(self):
+        payload = {
+            "title": "未知时长曲目",
+            "source": "/music/omitted-duration.flac",
+            "cover_url": "https://img.example/unknown.png",
+            "description": "时长待补",
+            "tags": ["待补"],
+        }
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        # 省略时长表示未知：成功记录中的时长为 null，不是 0。
+        self.assertIsNone(body["duration"])
+        self.assertEqual(body, {
+            "id": body["id"],
+            "title": "未知时长曲目",
+            "source": "/music/omitted-duration.flac",
+            "duration": None,
+            "cover_url": "https://img.example/unknown.png",
+            "description": "时长待补",
+            "tags": ["待补"],
+        })
+        self.assertIsNone(self.track_by_id(body["id"])["duration"])
+
+    def test_explicit_null_saved_as_unknown(self):
+        # 明确提交 null 与省略时长语义相同，都表示未知。
+        payload = {
+            "title": "显式未知曲目",
+            "source": "/music/null-duration.flac",
+            "duration": None,
+        }
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        self.assertIsNone(body["duration"])
+        self.assertEqual(self.track_by_id(body["id"]), body)
+
+    def test_known_and_unknown_distinct_records_coexist_in_id_order(self):
+        # 连续收录：已知整数、已知小数、0、未知各一条，验证列表按标识
+        # 升序展示，各标识的时长状态互不串扰。
+        known_int = self.assert_created_and_listed(
+            self.full_payload("/music/order-int.flac", 307,
+                              title="顺序·整数"),
+            307,
+        )
+        unknown = self.server.create_track(
+            title="顺序·未知", source="/music/order-unknown.flac",
+        )
+        self.assertIsNone(unknown["duration"])
+        zero = self.assert_created_and_listed(
+            self.full_payload("/music/order-zero.flac", 0,
+                              title="顺序·零"),
+            0,
+        )
+        decimal = self.assert_created_and_listed(
+            self.full_payload("/music/order-decimal.flac", 243.5,
+                              title="顺序·小数"),
+            243.5,
+        )
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [known_int["id"], unknown["id"], zero["id"], decimal["id"]],
+        )
+        self.assertEqual(
+            [t["duration"] for t in tracks],
+            [307, None, 0, 243.5],
+        )
+
+    def test_new_create_does_not_change_existing_records(self):
+        # 新增曲目不改变已有曲目的资料，列表仍按标识升序。
+        first = self.create_track(
+            title="已有曲目·甲",
+            source="/music/existing-a.flac",
+            duration=12,
+            cover_url="https://img.example/a.png",
+            description="甲的说明\n第二行",
+            tags=["民谣"],
+        )
+        second = self.create_track(
+            title="已有曲目·乙", source="/music/existing-b.flac",
+            duration=None,
+        )
+        before_ids = [first["id"], second["id"]]
+
+        new_record = self.assert_created_and_listed(
+            self.full_payload("/music/existing-c.flac", 95.5,
+                              title="已有曲目·丙"),
+            95.5,
+        )
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], before_ids + [new_record["id"]]
+        )
+        self.assertEqual(self.track_by_id(first["id"]), first)
+        self.assertEqual(self.track_by_id(second["id"]), second)
+
+
+class CreateDurationInvalidApiTest(ServerTestCase):
+    """收录接口：时长非法时 400 且 field=duration，整单不写入。
+
+    时长为负数或非有限数值，或写成字符串、布尔值、数组、对象时拒绝；
+    数字字符串即使看起来像合法秒数也不自动转换，false 不能变成 0。
+    其他资料都合法也不能保存部分内容：空曲库仍为空，已有曲库的记录
+    数量、顺序与各条完整资料保持提交前状态。
+    """
+
+    # 与非法时长一起提交的其他资料全部合法：即使如此也整单不写入。
+    def full_payload(self, source, duration):
+        return {
+            "title": "夜航·候选",
+            "source": source,
+            "duration": duration,
+            "cover_url": "https://img.example/candidate.png",
+            "description": "候选说明：中文、换行\n第二行",
+            "tags": ["候选", "新编"],
+        }
+
+    def assert_duration_rejected(self, payload):
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 400, body)
+        # field 指向 duration，错误文字说明时长有误；不是来源冲突响应。
+        self.assertEqual(body["field"], "duration")
+        self.assertIn("时长", body["error"])
+        self.assertNotIn("existing", body)
+
+    def test_negative_numbers_are_rejected(self):
+        for bad in (-1, -0.01, -243.5):
+            with self.subTest(bad=bad):
+                self.assert_duration_rejected(
+                    self.full_payload(f"/music/neg-{bad}.flac", bad)
+                )
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_non_finite_values_are_rejected(self):
+        # NaN、Infinity、-Infinity 以及解析后溢出为 Infinity 的指数写法，
+        # 都是非有限数值（通过原始 JSON 文本发送），不能保存。
+        for raw_fragment in ("NaN", "Infinity", "-Infinity", "1e999",
+                             "-1e999"):
+            with self.subTest(raw=raw_fragment):
+                status, body = self.post_raw(
+                    '{"title": "夜航·候选", '
+                    f'"source": "/music/nonfinite-{raw_fragment}.flac", '
+                    f'"duration": {raw_fragment}, '
+                    '"description": "不应保存的说明"}'
+                )
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "duration")
+                self.assertIn("时长", body["error"])
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_numeric_strings_are_rejected_without_coercion(self):
+        # 数字文字即使看起来是合法秒数也不能自动转换成数字；
+        # 网页允许在输入框里填写数字文字，不改变 JSON 接口对数字类型的要求。
+        for bad in ("243", "243.5", "0", "-1", " 12 ", ""):
+            with self.subTest(bad=repr(bad)):
+                self.assert_duration_rejected(
+                    self.full_payload(f"/music/str-{bad!r}.flac", bad)
+                )
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_boolean_is_rejected_without_becoming_zero_or_one(self):
+        # false 不能变成 0，true 也不能变成 1。
+        for bad in (False, True):
+            with self.subTest(bad=bad):
+                self.assert_duration_rejected(
+                    self.full_payload(f"/music/bool-{bad}.flac", bad)
+                )
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_array_and_object_are_rejected(self):
+        for bad in ([], [243.5], {}, {"seconds": 243.5}):
+            with self.subTest(bad=bad):
+                self.assert_duration_rejected(
+                    self.full_payload(f"/music/complex-{type(bad).__name__}.flac", bad)
+                )
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_other_scalar_types_are_rejected(self):
+        for bad in ("abc", "null", "NaN"):
+            with self.subTest(bad=repr(bad)):
+                self.assert_duration_rejected(
+                    self.full_payload(f"/music/text-{bad}.flac", bad)
+                )
+                self.assertEqual(self.list_tracks(), [])
+
+    def test_zero_accepted_but_string_zero_rejected(self):
+        # 对照保障：数字 0 正常收录，而字符串 "0" 被拒绝，二者不能混淆。
+        status, body = self.server.request(
+            "POST", "/api/tracks",
+            self.full_payload("/music/real-zero.flac", 0),
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["duration"], 0)
+
+        self.assert_duration_rejected(
+            self.full_payload("/music/string-zero.flac", "0")
+        )
+        # 字符串 "0" 没有产生第二条记录。
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["source"], "/music/real-zero.flac")
+        self.assertEqual(tracks[0]["duration"], 0)
+
+
+class CreateDurationInvalidWithExistingApiTest(ServerTestCase):
+    """已有曲库时收录接口时长失败：数量、顺序与各条完整资料保持原样。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="已有曲目·甲",
+            source="/music/existing-a.flac",
+            duration=12,
+            cover_url="https://img.example/a.png",
+            description="甲的说明\n第二行",
+            tags=["民谣"],
+        )
+        self.second = self.create_track(
+            title="已有曲目·乙",
+            source="/music/existing-b.flac",
+            duration=33.3,
+            description="",
+            tags=["现场"],
+        )
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=None,
+        )
+        self.expected_ids = [
+            self.first["id"], self.second["id"], self.bystander["id"],
+        ]
+
+    def full_payload(self, source, duration):
+        return {
+            "title": "不应收录的候选",
+            "source": source,
+            "duration": duration,
+            "cover_url": "https://img.example/candidate.png",
+            "description": "不应保存的候选说明\n第二行",
+            "tags": ["候选", "新编"],
+        }
+
+    def assert_library_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量不增加，顺序仍是标识升序。
+        self.assertEqual([t["id"] for t in tracks], self.expected_ids)
+        # 各条完整资料保持提交前状态，不能留下只有名称或来源的残缺记录。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+        self.assertEqual(
+            self.track_by_id(self.bystander["id"]), self.bystander
+        )
+
+    def test_every_invalid_shape_leaves_library_untouched(self):
+        cases = [
+            ("dict", -1),
+            ("dict", -0.25),
+            ("dict", "243.5"),
+            ("dict", "0"),
+            ("dict", False),
+            ("dict", True),
+            ("dict", []),
+            ("dict", {}),
+            ("raw", "NaN"),
+            ("raw", "Infinity"),
+            ("raw", "-Infinity"),
+            ("raw", "1e999"),
+        ]
+        for index, (kind, value) in enumerate(cases):
+            with self.subTest(value=value):
+                source = f"/music/fresh-duration-case-{index}.flac"
+                if kind == "dict":
+                    status, body = self.server.request(
+                        "POST", "/api/tracks",
+                        self.full_payload(source, value),
+                    )
+                else:
+                    status, body = self.post_raw(
+                        '{"title": "不应收录的候选", '
+                        f'"source": "{source}", '
+                        f'"duration": {value}, '
+                        '"description": "不应保存的候选说明"}'
+                    )
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "duration")
+                self.assertIn("时长", body["error"])
+                self.assert_library_unchanged()
+
+    def test_valid_create_after_duration_failures_extends_library(self):
+        # 多次时长失败后，一次合法收录仍能成功，接在已有记录之后，
+        # 失败请求不留下额外记录。
+        for bad in (-1, "243.5", False):
+            status, _ = self.server.request(
+                "POST", "/api/tracks",
+                {
+                    "title": "失败候选",
+                    "source": f"/music/never-written-{bad!r}.flac",
+                    "duration": bad,
+                    "description": "不应保存",
+                },
+            )
+            self.assertEqual(status, 400)
+        self.assert_library_unchanged()
+
+        status, body = self.server.request("POST", "/api/tracks", {
+            "title": "补收录的曲目",
+            "source": "/music/after-duration-failures.flac",
+            "duration": 240,
+            "description": "修正后收录",
+        })
+        self.assertEqual(status, 201, body)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            self.expected_ids + [body["id"]],
+        )
+        self.assertEqual(self.track_by_id(body["id"]), body)
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(self.track_by_id(self.second["id"]), self.second)
+
+
+class CreateDurationNewVersionApiTest(ServerTestCase):
+    """同一来源明确另存新版本：时长规则与普通收录完全相同。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+
+    def test_valid_duration_saved_under_new_id_with_original_intact(self):
+        payload = {
+            "title": "夜航·重制",
+            # 仅首尾空白不同仍视为同一来源，但本次明确要求另存。
+            "source": " \t/music/yehang.flac\n ",
+            "duration": 250,
+            "cover_url": "https://img.example/yehang-remaster.png",
+            "description": "重制说明",
+            "tags": ["民谣", "重制"],
+            "save_as_new_version": True,
+        }
+        status, body = self.server.request("POST", "/api/tracks", payload)
+        self.assertEqual(status, 201, body)
+        self.assertNotEqual(body["id"], self.first["id"])
+        # 合法时长随本次资料保存到新标识下。
+        self.assertEqual(body, {
+            "id": body["id"],
+            "title": "夜航·重制",
+            "source": "/music/yehang.flac",
+            "duration": 250,
+            "cover_url": "https://img.example/yehang-remaster.png",
+            "description": "重制说明",
+            "tags": ["民谣", "重制"],
+        })
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], [self.first["id"], body["id"]]
+        )
+        # 原版本的时长与其他资料保持原样，没有被覆盖。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+    def test_null_duration_new_version_leaves_known_original_intact(self):
+        # 新版本时长未知，原版本仍是已知时长，两者互不影响。
+        status, body = self.server.request("POST", "/api/tracks", {
+            "title": "夜航·现场",
+            "source": "/music/yehang.flac",
+            "duration": None,
+            "save_as_new_version": True,
+        })
+        self.assertEqual(status, 201, body)
+        self.assertIsNone(body["duration"])
+        self.assertEqual(self.track_by_id(body["id"])["duration"], None)
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(
+            self.track_by_id(self.first["id"])["duration"], 243.5
+        )
+
+    def assert_rejected_without_new_version(self, payload, *, raw=False):
+        if raw:
+            status, body = self.post_raw(payload)
+        else:
+            status, body = self.server.request(
+                "POST", "/api/tracks", payload
+            )
+        self.assertEqual(status, 400, body)
+        # 即使已明确同意另存，也报告时长错误。
+        self.assertEqual(body["field"], "duration")
+        self.assertIn("时长", body["error"])
+        # 不新增版本，不覆盖旧曲目。
+        tracks = self.list_tracks()
+        self.assertEqual([t["id"] for t in tracks], [self.first["id"]])
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+    def test_invalid_duration_with_flag_creates_no_new_version(self):
+        for bad in (-1, "243.5", "0", False, True, [], {}):
+            with self.subTest(bad=bad):
+                self.assert_rejected_without_new_version({
+                    "title": "夜航·失败重录",
+                    "source": "/music/yehang.flac",
+                    "duration": bad,
+                    "cover_url": "https://img.example/new.png",
+                    "description": "不应保存的重录说明",
+                    "tags": ["重录"],
+                    "save_as_new_version": True,
+                })
+
+    def test_non_finite_duration_with_flag_creates_no_new_version(self):
+        for raw_fragment in ("NaN", "Infinity", "-Infinity", "1e999"):
+            with self.subTest(raw=raw_fragment):
+                self.assert_rejected_without_new_version(
+                    '{"title": "夜航·失败重录", '
+                    '"source": "/music/yehang.flac", '
+                    f'"duration": {raw_fragment}, '
+                    '"description": "不应保存的重录说明", '
+                    '"save_as_new_version": true}',
+                    raw=True,
+                )
 
 
 class HomeCreateRequiredFieldEmptyLibraryTest(ServerTestCase):
