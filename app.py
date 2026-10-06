@@ -418,6 +418,13 @@ def render_track_form(form, error, error_field, *, action, submit_label,
     if edit_mode:
         cancel = '<p class="form-cancel"><a href="/">取消编辑，返回曲目列表</a></p>\n'
 
+    # 名称按文字保存，内部换行与空格都是名称的一部分：用多行输入框完整
+    # 呈现已保存名称（含开头空行，由 textarea_content 抵消 HTML 解析
+    # 吞掉的第一个换行），框高随实际行数自适应。
+    title_text = form.get("title", "")
+    title_rows = min(
+        max(1, len(re.findall(r"\r\n|\r|\n", title_text)) + 1), 10
+    )
     # 来源按文字保存，内部换行与空格都是来源的一部分：用多行输入框完整
     # 呈现已保存来源（含开头空行，由 textarea_content 抵消 HTML 解析
     # 吞掉的第一个换行），框高随实际行数自适应。
@@ -474,8 +481,8 @@ def render_track_form(form, error, error_field, *, action, submit_label,
         )
 
     return f'''<form class="track-form" method="post" action="{esc(action)}" novalidate>
-  <label for="f-title">名称 <span class="hint">（必填）</span></label>
-  <input type="text" id="f-title" name="title" value="{value("title")}">
+  <label for="f-title">名称 <span class="hint">（必填，可在框内换行写成多行；按文字原样保存，只裁掉首尾空白，内部换行与空格都会保留）</span></label>
+  <textarea id="f-title" name="title" class="title-box" rows="{title_rows}">{textarea_content(title_text)}</textarea>
   {inline_error("title")}
   <label for="f-source">来源 <span class="hint">（必填，网址或本地文件路径，按文字原样保存，内部换行与空格都会保留，不检查能否播放）</span></label>
   <textarea id="f-source" name="source" class="source-box" rows="{source_rows}">{textarea_content(source_text)}</textarea>
@@ -598,6 +605,7 @@ form.track-form .hint{{font-weight:400;color:#627d98;font-size:.9em}}
 form.track-form input[type=text],form.track-form textarea{{width:100%;box-sizing:border-box;padding:.45rem .6rem;border:1px solid #bcccdc;border-radius:4px;font:inherit}}
 form.track-form textarea{{min-height:5.5rem;resize:vertical}}
 form.track-form textarea.source-box{{min-height:2.4rem}}
+form.track-form textarea.title-box{{min-height:2.4rem}}
 .field-error{{color:#b3261e;margin:.25rem 0 0;font-size:.92em}}
 form.track-form button{{margin-top:1.1rem;padding:.5rem 1.2rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#1769aa;color:#fff;cursor:pointer}}
 .form-cancel{{margin:.6rem 0 0;font-size:.95em}}
@@ -607,7 +615,7 @@ ol.tracks{{list-style:none;padding:0;display:flex;flex-direction:column;gap:1rem
 ol.tracks li{{border:1px solid #d9e2ec;border-radius:8px;padding:.8rem 1.1rem;background:#fff}}
 ol.tracks li.highlight{{border-color:#1769aa;box-shadow:0 0 0 2px rgba(23,105,170,.18)}}
 .track-id{{display:inline-block;min-width:2.6em;color:#627d98;font-variant-numeric:tabular-nums}}
-.track-title{{font-size:1.12em;font-weight:700;margin:0 0 .4rem}}
+.track-title{{font-size:1.12em;font-weight:700;margin:0 0 .4rem;white-space:pre-wrap}}
 .track-meta{{display:grid;grid-template-columns:5.5rem 1fr;gap:.15rem .8rem;margin:0}}
 .track-meta dt{{color:#627d98}}
 .track-meta dd{{margin:0;word-break:break-all}}
@@ -781,7 +789,10 @@ def form_to_payload(form, *, edit_mode=False):
         description = one("description")
 
     payload = {
-        "title": one("title"),
+        # 名称框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
+        # LF，使网页填写的名称与接口按文字收录的同一段名称一致；编辑时
+        # 调用方再据此判断用户是否真的改过名称。
+        "title": normalize_newlines(one("title")),
         # 来源框也是多行输入框：浏览器按 CRLF 提交框内换行，统一归一化为
         # LF，使网页填写的来源与接口按文字收录的同一段来源一致；编辑时
         # 调用方再据此判断用户是否真的改过来源。
@@ -855,6 +866,9 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
+            # 失败重绘时按 LF 回填名称框（浏览器以 CRLF 提交框内换行），
+            # 名称中的内部换行与空格按本次填写完整保留。
+            form_view["title"] = normalize_newlines(form_view["title"])
             form_view["save_as_new_version"] = (
                 form.get("save_as_new_version", [""])[0] in ("1", "on", "true", "yes")
             )
@@ -945,9 +959,11 @@ def main():
             raw = self.read_body().decode("utf-8", errors="replace")
             form = parse_qs(raw, keep_blank_values=True)
             form_view = {name: form.get(name, [""])[0] for name in FORM_FIELDS}
-            # 失败重绘时按 LF 回填来源框与说明框（浏览器以 CRLF 提交换行），
+            # 失败重绘时按 LF 回填名称框、来源框与说明框（浏览器以 CRLF
+            # 提交换行），名称的内部换行与空格（含连续空行、各行文字）、
             # 来源的内部换行与空格、说明的开头空行、段落空行、结尾空行与
             # 首尾空格都按本次填写完整保留。
+            form_view["title"] = normalize_newlines(form_view["title"])
             form_view["source"] = normalize_newlines(form_view["source"])
             form_view["description"] = normalize_newlines(
                 form_view["description"]
@@ -972,6 +988,16 @@ def main():
                 payload["tags"] = reconcile_edit_tags(
                     submitted_tags, submitted_refs, record["tags"]
                 )
+                # 用户没有改动名称时（提交文字去掉首尾空白、换行归一化后
+                # 与原名称一致），不提交该字段：原名称逐字节保留，原文使用
+                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
+                # 被改写，仅内部换行写法不同的两段名称也不会因此变成同一
+                # 段；仅在名称首尾增删空白沿用现有裁剪规则，同样不算改动
+                # 内部内容。确实修改名称内部的文字、空格或分行时才按本次
+                # 填写（换行统一为 LF）去掉首尾空白保存。
+                if (payload["title"].strip()
+                        == normalize_newlines(record["title"]).strip()):
+                    del payload["title"]
                 # 用户没有修改说明时（提交文字在换行归一化后与原说明一致），
                 # 不提交该字段：原说明逐字节保留，LF/CRLF 写法、首尾空白、
                 # 空串与纯空白说明的区别都不因本次保存被改写；确实改了说明
