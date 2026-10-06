@@ -731,15 +731,67 @@ def render_track(record, highlight=None):
 render_track.highlight = None
 
 
+# ---------------------------------------------------------------------------
+# 编辑页文字字段的“浏览器换行兼容”。
+#
+# form_to_payload 已把 textarea 提交的 CRLF/CR 换行归一化为 LF（浏览器
+# 总按 CRLF 提交框内换行，旧记录也可能直接收录 CR）；保存前再统一判断
+# 归一化后的提交文字是否意味着内容真的改变：
+#   - 名称、来源、标签项（trim_outer=True）：换行归一化并去掉整段首尾
+#     空白后相同即视为未改动，首尾增删空白沿用各自既有的裁剪规则；
+#   - 说明（trim_outer=False）：只归一化换行，开头/结尾空行与首尾空格
+#     都是实际内容，空字符串与只含空白的说明不能混为一谈。
+# 判定未改动时保留库里的完整原文（逐字节保留 LF/CRLF/CR 写法），确实
+# 改动时才采用本次填写（网页改动的换行统一为 LF）。这套判断只服务编辑
+# 表单保存：直接打接口提交的文字不经过这里，不新增任何规整规则。
+
+
+def edit_text_unchanged(submitted, original, *, trim_outer):
+    """编辑表单提交的文字（换行已归一化为 LF）相对原文是否未改动。
+
+    original 是库里保存的完整原文，可能使用 LF、CRLF 或 CR 换行；
+    比较前对原文做同样的换行归一化，避免浏览器提交写法被当成改动。
+    trim_outer 为 True 时（名称、来源、标签项）忽略整段首尾空白，
+    为 False 时（说明）首尾空白也逐字参与比较。
+    """
+    baseline = normalize_newlines(original)
+    if trim_outer:
+        return submitted.strip() == baseline.strip()
+    return submitted == baseline
+
+
+def reconcile_edit_text(submitted, original, *, trim_outer):
+    """编辑页单个文字字段最终保存的文字。
+
+    用户未改动时返回原文完整字节（含原有 LF/CRLF/CR 换行写法），
+    确实改动时返回本次填写内容（换行已统一为 LF）。
+    """
+    if edit_text_unchanged(submitted, original, trim_outer=trim_outer):
+        return original
+    return submitted
+
+
+def omit_unchanged_edit_field(payload, field, original, *, trim_outer):
+    """把编辑页的一个整段文字字段并入 PATCH 数据。
+
+    用户未改动时直接从 payload 删除该字段：update_track 对“未提交”的
+    字段保留旧值，原文（换行写法、说明首尾空白）得以逐字节保留；确实
+    改动时保留 payload 中已归一化为 LF 的填写内容，首尾空白仍由各字段
+    既有的统一校验规则处理（名称、来源裁整段首尾，说明完整保留）。
+    """
+    if edit_text_unchanged(payload[field], original, trim_outer=trim_outer):
+        del payload[field]
+
+
 def reconcile_edit_tags(submitted, refs, originals):
     """把编辑页提交的标签逐项对齐到原始标签，决定最终保存的完整文字。
 
     submitted 为各框文字（已归一化为 LF），refs 为各框对应的原始标签
-    序号（新增框为空，序号越界或缺失时按新增处理）。框内文字去掉首尾
-    空白、换行归一化后与对应原始项一致时，视为未修改：保留原始项的
-    完整原文（含 LF/CRLF/CR 换行写法），浏览器显示与提交换行的写法
-    差异不算修改；否则按本次填写的文字保存。首尾空白裁剪、空项忽略
-    与按最终完整文字去重仍交由统一校验规则处理。
+    序号（新增框为空，序号越界或缺失时按新增处理）。框内文字是否改动
+    与名称、来源共用同一判断（换行归一化、去掉整项首尾空白后比较）：
+    未修改时保留原始项的完整原文（含 LF/CRLF/CR 换行写法），浏览器显示
+    与提交换行的写法差异不算修改；否则按本次填写的文字保存。首尾空白
+    裁剪、空项忽略与按最终完整文字去重仍交由统一校验规则处理。
     """
     final = []
     for index, text in enumerate(submitted):
@@ -747,10 +799,12 @@ def reconcile_edit_tags(submitted, refs, originals):
         if ref.isdigit():
             position = int(ref)
             if position < len(originals):
-                original = originals[position]
-                if text.strip() == normalize_newlines(original).strip():
-                    final.append(original)
-                    continue
+                final.append(
+                    reconcile_edit_text(
+                        text, originals[position], trim_outer=True
+                    )
+                )
+                continue
         final.append(text)
     return final
 
@@ -988,38 +1042,32 @@ def main():
                 payload["tags"] = reconcile_edit_tags(
                     submitted_tags, submitted_refs, record["tags"]
                 )
-                # 用户没有改动名称时（提交文字去掉首尾空白、换行归一化后
-                # 与原名称一致），不提交该字段：原名称逐字节保留，原文使用
-                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
-                # 被改写，仅内部换行写法不同的两段名称也不会因此变成同一
-                # 段；仅在名称首尾增删空白沿用现有裁剪规则，同样不算改动
-                # 内部内容。确实修改名称内部的文字、空格或分行时才按本次
-                # 填写（换行统一为 LF）去掉首尾空白保存。
-                if (payload["title"].strip()
-                        == normalize_newlines(record["title"]).strip()):
-                    del payload["title"]
-                # 用户没有修改说明时（提交文字在换行归一化后与原说明一致），
-                # 不提交该字段：原说明逐字节保留，LF/CRLF 写法、首尾空白、
-                # 空串与纯空白说明的区别都不因本次保存被改写；确实改了说明
-                # 时才按本次填写保存（换行统一为 LF）。
-                if payload["description"] == normalize_newlines(
-                    record["description"]
-                ):
-                    del payload["description"]
-                # 用户没有改动来源时（提交文字去掉首尾空白、换行归一化后
-                # 与原来源一致），不提交该字段：原来源逐字节保留，原文使用
-                # 的 LF/CRLF/CR 换行写法不因网页显示与表单提交的写法差异
-                # 被改写，仅内部换行写法不同的两段来源也不会因此变成同一
-                # 段；确实修改来源内部的文字、空格或分行时才按本次填写
-                # （换行统一为 LF）去掉首尾空白保存并参与判重。
-                # 旧记录原本没有来源时，留空的来源继续保持缺失状态，
-                # 不参与来源判重；已有来源的记录清空来源会被校验拒绝。
+                # 名称、来源、说明统一按编辑页文字字段处理：浏览器提交时
+                # 换行已归一化为 LF，归一化后的提交文字与原文按各字段规则
+                # 比较相同（名称、来源还会去掉整段首尾空白，说明则逐字比较）
+                # 即视为未改动，不提交该字段，由 update_track 的“未提交保留
+                # 旧值”语义逐字节保留原文——LF/CRLF/CR 换行写法、说明的
+                # 首尾空白、空串与纯空白说明的区别都不被改写；仅首尾增删
+                # 空白沿用名称、来源既有的裁剪规则，不算改动内部内容。
+                # 确实改动时才按本次填写（换行统一为 LF）保存：名称、来源
+                # 只裁整段首尾空白，说明完整保留。
+                omit_unchanged_edit_field(
+                    payload, "title", record["title"], trim_outer=True
+                )
+                omit_unchanged_edit_field(
+                    payload, "description", record["description"],
+                    trim_outer=False,
+                )
+                # 旧记录原本没有来源时，留空的来源继续保持缺失状态：同样
+                # 不提交该字段，也不参与来源判重；已有来源的记录清空来源
+                # 会被校验拒绝。
                 if record["source"] is None:
                     if not payload["source"].strip():
                         del payload["source"]
-                elif (payload["source"].strip()
-                      == normalize_newlines(record["source"]).strip()):
-                    del payload["source"]
+                else:
+                    omit_unchanged_edit_field(
+                        payload, "source", record["source"], trim_outer=True
+                    )
                 updated, conflicts = update_track(database, track_id, payload)
             except PayloadError as exc:
                 self.error_page(
