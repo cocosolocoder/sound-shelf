@@ -207,6 +207,10 @@ SOURCE_RE = re.compile(
     r'<textarea id="f-source" name="source"[^>]*>(.*?)</textarea>',
     re.DOTALL,
 )
+COVER_RE = re.compile(
+    r'<textarea id="f-cover-url" name="cover_url"[^>]*>(.*?)</textarea>',
+    re.DOTALL,
+)
 BANNER_ERROR_RE = re.compile(
     r'<p class="banner error" role="alert">(.*?)</p>', re.DOTALL
 )
@@ -281,6 +285,20 @@ def parse_source_box(page):
     match = SOURCE_RE.search(page)
     assert match is not None, "页面中找不到来源输入框"
     return textarea_browser_text(match.group(1))
+
+
+def parse_cover_box(page):
+    """提取封面地址框在浏览器中呈现的文字（与说明框相同的 HTML 解析规则）。"""
+    match = COVER_RE.search(page)
+    assert match is not None, "页面中找不到封面地址输入框"
+    return textarea_browser_text(match.group(1))
+
+
+def cover_box_markup(page):
+    """返回封面地址框 textarea 的整段标记，用于断言转义发生在该框内部。"""
+    match = COVER_RE.search(page)
+    assert match is not None, "页面中找不到封面地址输入框"
+    return match.group(0)
 
 
 def parse_title_box(page):
@@ -576,7 +594,7 @@ class ServerTestCase(unittest.TestCase):
             ("title", parse_title_box(page)),
             ("source", parse_source_box(page)),
             ("duration", parse_input_value(page, "duration", "duration")),
-            ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
+            ("cover_url", parse_cover_box(page)),
             ("description", parse_description_box(page)),
         ]
         for box, ref in zip(parse_tag_boxes(page), parse_tag_refs(page)):
@@ -611,9 +629,7 @@ class ServerTestCase(unittest.TestCase):
                 parse_input_value(page, "duration", "duration"), duration
             )
         if cover_url is not None:
-            self.assertEqual(
-                parse_input_value(page, "cover-url", "cover_url"), cover_url
-            )
+            self.assertEqual(parse_cover_box(page), cover_url)
         if description is not None:
             match = DESCRIPTION_RE.search(page)
             self.assertIsNotNone(match)
@@ -659,7 +675,7 @@ class ServerTestCase(unittest.TestCase):
             ("title", parse_title_box(page)),
             ("source", parse_source_box(page)),
             ("duration", parse_input_value(page, "duration", "duration")),
-            ("cover_url", parse_input_value(page, "cover-url", "cover_url")),
+            ("cover_url", parse_cover_box(page)),
             ("description", parse_description_box(page)),
             ("tags", parse_input_value(page, "tags", "tags")),
         ]
@@ -1645,7 +1661,7 @@ class EditPageDurationKeepsMetadataTest(ServerTestCase):
         fields = self.form_with_field(fields, "duration", "243.5")
         fields = [
             (name, value.replace("\n", "\r\n"))
-            if name in ("description", "tags") else (name, value)
+            if name in ("cover_url", "description", "tags") else (name, value)
             for name, value in fields
         ]
         location, listing_page = self.submit_edit_form_and_open_listing(
@@ -1934,7 +1950,7 @@ class EditPageDurationRetryAfterFailureTest(ServerTestCase):
         retry_fields = self.form_with_field(retry_fields, "duration", "243.5")
         retry_fields = [
             (name, value.replace("\n", "\r\n"))
-            if name in ("description", "tags") else (name, value)
+            if name in ("cover_url", "description", "tags") else (name, value)
             for name, value in retry_fields
         ]
         location, listing_page = self.submit_edit_form_and_open_listing(
@@ -2194,7 +2210,7 @@ class EditPageTitleRetryAfterFailureTest(ServerTestCase):
         )
         retry_fields = [
             (name, value.replace("\n", "\r\n"))
-            if name in ("description", "tags") else (name, value)
+            if name in ("cover_url", "description", "tags") else (name, value)
             for name, value in retry_fields
         ]
         location, listing_page = self.submit_edit_form_and_open_listing(
@@ -2393,7 +2409,7 @@ class EditPageMultilineTitleUntouchedSaveTest(ServerTestCase):
         fields = self.edit_fields_from_rendered_page(page)
         fields = [
             (name, browser_newlines(value))
-            if name in ("title", "source", "description", "tags")
+            if name in ("title", "source", "cover_url", "description", "tags")
             else (name, value)
             for name, value in fields
         ]
@@ -2639,7 +2655,7 @@ class EditPageMultilineTitleFailureTest(ServerTestCase):
         retry_fields = self.form_with_field(retry_fields, "duration", "300")
         retry_fields = [
             (name, browser_newlines(value))
-            if name in ("title", "source", "description", "tags")
+            if name in ("title", "source", "cover_url", "description", "tags")
             else (name, value)
             for name, value in retry_fields
         ]
@@ -3707,7 +3723,7 @@ class EditPageSourceUntouchedSaveTest(ServerTestCase):
         fields = self.edit_fields_from_rendered_page(page)
         fields = [
             (name, browser_newlines(value))
-            if name in ("source", "description", "tags") else (name, value)
+            if name in ("source", "cover_url", "description", "tags") else (name, value)
             for name, value in fields
         ]
         for name, value in changes.items():
@@ -3902,7 +3918,7 @@ class EditPageSourceSaveFailureTest(ServerTestCase):
         fields = self.form_with_field(fields, "duration", "-5")
         fields = [
             (name, browser_newlines(value))
-            if name in ("source", "description", "tags") else (name, value)
+            if name in ("source", "cover_url", "description", "tags") else (name, value)
             for name, value in fields
         ]
         status, _, page = self.post_edit_form(track["id"], fields)
@@ -3919,7 +3935,7 @@ class EditPageSourceSaveFailureTest(ServerTestCase):
         fields = self.form_with_field(fields, "duration", "240")
         fields = [
             (name, browser_newlines(value))
-            if name in ("source", "description", "tags") else (name, value)
+            if name in ("source", "cover_url", "description", "tags") else (name, value)
             for name, value in fields
         ]
         status, _, page = self.post_edit_form(track["id"], fields)
@@ -3947,7 +3963,7 @@ class EditPageSourceSaveFailureTest(ServerTestCase):
         fields = self.form_with_field(fields, "duration", "240")
         fields = [
             (name, browser_newlines(value))
-            if name in ("source", "description", "tags") else (name, value)
+            if name in ("source", "cover_url", "description", "tags") else (name, value)
             for name, value in fields
         ]
         status, _, page = self.post_edit_form(track["id"], fields)
@@ -3997,6 +4013,539 @@ class EditPageLegacySourceTest(ServerTestCase):
             parse_conflict_items(page), [(occupant["id"], "占用者")]
         )
         self.assertIsNone(self.track_by_id(legacy_id)["source"])
+
+
+class EditPageCoverRenderTest(ServerTestCase):
+    """打开编辑页：封面地址框完整还原已保存地址的内部文字、空格与分行。"""
+
+    MULTILINE_COVER = (
+        "封面/第一段 中文.png\n第二段：  双空格\n\n空行后的 <x>.jpg"
+    )
+
+    def test_multiline_cover_renders_line_by_line_in_cover_box(self):
+        track = self.create_track(title="多行封面", source="/music/a.flac",
+                                 cover_url=self.MULTILINE_COVER)
+        page = self.get_edit_page(track["id"])
+        # 框内文字与已保存地址一致：中文、内部换行、行内空格、空行都在。
+        self.assertEqual(parse_cover_box(page), self.MULTILINE_COVER)
+
+    def test_single_line_cover_renders_without_extra_blank_lines(self):
+        track = self.create_track(
+            title="单行封面", source="/music/b.flac",
+            cover_url="https://img.example/one.png",
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(
+            parse_cover_box(page), "https://img.example/one.png"
+        )
+        # 单行地址不凭空多出空行，框高按一行渲染。
+        self.assertIn(
+            '<textarea id="f-cover-url" name="cover_url" class="cover-box" '
+            'rows="1">https://img.example/one.png</textarea>',
+            page,
+        )
+
+    def test_internal_blank_lines_render_in_place(self):
+        cover = "封面/第一段.png\n\n\n空两行后的段落\n结尾行"
+        track = self.create_track(title="内部空行", source="/music/c.flac",
+                                 cover_url=cover)
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_cover_box(page), cover)
+        self.assertEqual(
+            parse_cover_box(page).split("\n"),
+            ["封面/第一段.png", "", "", "空两行后的段落", "结尾行"],
+        )
+
+    def test_crlf_and_cr_covers_render_with_same_lines(self):
+        for index, raw in enumerate(
+            ("第一段\r\n第二段\r\n第三段", "第一段\r第二段")
+        ):
+            with self.subTest(raw=raw):
+                track = self.create_track(
+                    title=f"换行写法{index}", source=f"/music/d{index}.flac",
+                    cover_url=raw,
+                )
+                page = self.get_edit_page(track["id"])
+                # 浏览器把 CRLF/CR 都显示为换行：框内呈现相同的行与文字。
+                self.assertEqual(
+                    parse_cover_box(page),
+                    raw.replace("\r\n", "\n").replace("\r", "\n"),
+                )
+
+    def test_html_looking_cover_is_shown_as_plain_text(self):
+        cover = 'https://img.example/<b>not-bold</b>&"q"\n第二行<script>.png'
+        track = self.create_track(title="转义封面", source="/music/e.flac",
+                                 cover_url=cover)
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_cover_box(page), cover)
+        # 标记内部按普通文字转义，引号、尖括号与形似标签的内容不会变成
+        # 页面元素。
+        markup = cover_box_markup(page)
+        self.assertIn("&lt;b&gt;", markup)
+        self.assertNotIn("<b>not-bold</b>", markup)
+        self.assertNotIn("<script>", markup)
+        self.assertIn("&quot;q&quot;", markup)
+        self.assertNotIn('<script>.png', page)
+
+    def test_empty_cover_renders_as_empty_box(self):
+        # 接口规则只去掉整段首尾空白：已保存记录里的地址要么是空串、
+        # 要么是不含首尾空白的文字；首尾只剩空白的提交保存为空串。
+        track = self.create_track(
+            title="无封面", source="/music/none.flac", cover_url=""
+        )
+        page = self.get_edit_page(track["id"])
+        self.assertEqual(parse_cover_box(page), "")
+        self.assertIn(
+            '<textarea id="f-cover-url" name="cover_url" class="cover-box" '
+            'rows="1"></textarea>',
+            page,
+        )
+
+
+class EditPageCoverUntouchedSaveTest(ServerTestCase):
+    """未改封面地址（或仅增删首尾空白）的保存：原地址完整文字逐字节保留。"""
+
+    LF_COVER = "https://img.example/第一段\n第二行  art.png\n\n尾行"
+    CRLF_COVER = LF_COVER.replace("\n", "\r\n")
+    CR_COVER = "第一段\r第二段\r第三段"
+
+    TEXTAREA_FIELDS = ("title", "source", "cover_url", "description", "tags")
+
+    def save_via_form(self, track, **changes):
+        """模拟浏览器：打开编辑页，整表取回（textarea 换行按 CRLF 提交）。"""
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = [
+            (name, browser_newlines(value))
+            if name in self.TEXTAREA_FIELDS else (name, value)
+            for name, value in fields
+        ]
+        for name, value in changes.items():
+            fields = self.form_with_field(fields, name, value)
+        return self.post_edit_form(track["id"], fields)
+
+    def assert_cover_preserved(self, cover):
+        track = self.create_track(
+            title="多行封面曲目", source="/music/cover.flac",
+            duration=120, cover_url=cover,
+        )
+        status, _, page = self.save_via_form(
+            track, title="只改了名称", duration="300"
+        )
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["title"], "只改了名称")
+        self.assertEqual(record["duration"], 300)
+        # 原封面地址逐字节保留：换行写法不因网页显示与表单提交被改写。
+        self.assertEqual(record["cover_url"], cover)
+        # 列表接口读到的地址与保存前一致，曲目标识不变。
+        self.assertEqual(record["id"], track["id"])
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], cover)
+        return record
+
+    def test_lf_cover_survives_browser_crlf_submission(self):
+        record = self.assert_cover_preserved(self.LF_COVER)
+        self.assertNotIn("\r", record["cover_url"])
+
+    def test_crlf_cover_survives_browser_crlf_submission(self):
+        record = self.assert_cover_preserved(self.CRLF_COVER)
+        self.assertIn("\r\n", record["cover_url"])
+
+    def test_cr_cover_survives_browser_crlf_submission(self):
+        record = self.assert_cover_preserved(self.CR_COVER)
+        self.assertIn("\r", record["cover_url"])
+        self.assertNotIn("\r\n", record["cover_url"])
+
+    def test_repeated_resaves_keep_cover_stable(self):
+        track = self.create_track(
+            title="反复保存", source="/music/repeat.flac", duration=10,
+            cover_url=self.CRLF_COVER,
+        )
+        for round_index in range(2):
+            status, _, page = self.save_via_form(
+                self.track_by_id(track["id"]), title=f"第 {round_index} 次改名"
+            )
+            self.assertEqual(status, 303, page[:500])
+            self.assertEqual(
+                self.track_by_id(track["id"])["cover_url"], self.CRLF_COVER
+            )
+
+    def test_surrounding_whitespace_only_counts_as_untouched(self):
+        track = self.create_track(
+            title="首尾空白", source="/music/pad.flac", duration=10,
+            cover_url=self.CRLF_COVER,
+        )
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        # 用户只在封面地址首尾增删空白（含换行），内部一字未动。
+        padded = "  \r\n" + browser_newlines(self.LF_COVER) + "\t \r\n"
+        fields = self.form_with_field(fields, "cover_url", padded)
+        fields = self.form_with_field(fields, "duration", "11")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 303, page[:500])
+        # 仍保留原地址的完整文字与 CRLF 写法，不按去掉首尾空白后的文字重写。
+        self.assertEqual(
+            self.track_by_id(track["id"])["cover_url"], self.CRLF_COVER
+        )
+        self.assertEqual(self.track_by_id(track["id"])["duration"], 11)
+
+    def test_newline_style_variants_stay_two_distinct_records(self):
+        # 两段地址只在内部换行写法上不同：各自保留，打开编辑页再保存其他
+        # 资料不会把它们变成同一段文字。
+        lf_track = self.create_track(
+            title="LF 版本", source="/music/lf.flac", cover_url="甲\n乙"
+        )
+        crlf_track = self.create_track(
+            title="CRLF 版本", source="/music/crlf.flac",
+            cover_url="甲\r\n乙",
+        )
+        status, _, page = self.save_via_form(lf_track, title="LF 版本（改名）")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(lf_track["id"])["cover_url"], "甲\n乙"
+        )
+        status, _, page = self.save_via_form(
+            crlf_track, title="CRLF 版本（改名）"
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(lf_track["id"])["cover_url"], "甲\n乙"
+        )
+        self.assertEqual(
+            self.track_by_id(crlf_track["id"])["cover_url"], "甲\r\n乙"
+        )
+
+    def test_missing_cover_stays_empty_when_other_fields_change(self):
+        track = self.create_track(
+            title="原本无封面", source="/music/none.flac", duration=12
+        )
+        status, _, page = self.save_via_form(track, duration="24")
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["cover_url"], "")
+        self.assertEqual(parse_cover_box(self.get_edit_page(track["id"])), "")
+
+
+class EditPageCoverChangesTest(ServerTestCase):
+    """确实修改封面地址内部文字、空格或分行：按本次填写（LF）trim 后保存。"""
+
+    TEXTAREA_FIELDS = ("title", "source", "cover_url", "description", "tags")
+
+    def submit_cover(self, track_id, typed_cover, **changes):
+        page = self.get_edit_page(track_id)
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = [
+            (name, browser_newlines(value))
+            if name in self.TEXTAREA_FIELDS else (name, value)
+            for name, value in fields
+        ]
+        # typed_cover 已按浏览器换行写法（CRLF）给出。
+        fields = self.form_with_field(fields, "cover_url", typed_cover)
+        for name, value in changes.items():
+            fields = self.form_with_field(fields, name, value)
+        return self.post_edit_form(track_id, fields)
+
+    def test_edited_cover_saved_with_lf_newlines_and_trimmed(self):
+        track = self.create_track(
+            title="待改封面", source="/music/old.flac", duration=120,
+            cover_url="https://img.example/old.png",
+        )
+        typed = "  新地址/第一段\r\n第二行  \r\n\r\n第三段\r\n "
+        status, headers, page = self.submit_cover(track["id"], typed)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            headers["Location"], f"/?highlight={track['id']}&edited=1"
+        )
+        # 内部换行统一为 LF，首尾空白去掉，内部文字、双空格与空行保留。
+        saved = "新地址/第一段\n第二行  \n\n第三段"
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["cover_url"], saved)
+        self.assertNotIn("\r", record["cover_url"])
+        # 其他明确修改的资料正常更新，标识不变、不新增记录。
+        self.assertEqual(record["id"], track["id"])
+        self.assertEqual(len(self.list_tracks()), 1)
+        # 重新打开编辑页与列表接口读到的地址都与保存结果一致。
+        self.assertEqual(parse_cover_box(self.get_edit_page(track["id"])), saved)
+
+    def test_changing_only_line_breaks_saves_typed_layout(self):
+        # 只调整分行（拆行、改行）也属于修改地址：按本次分行（LF）保存。
+        track = self.create_track(
+            title="只调分行", source="/music/layout.flac",
+            cover_url="旧地址\n第二行",
+        )
+        status, _, page = self.submit_cover(
+            track["id"], "旧地址第二行\r新拆的一行"
+        )
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["cover_url"],
+            "旧地址第二行\n新拆的一行",
+        )
+
+    def test_non_url_text_is_kept_verbatim(self):
+        # 地址按一段文字维护，不根据网址格式替用户改写内容。
+        track = self.create_track(
+            title="非网址地址", source="/music/text.flac",
+            cover_url="旧地址",
+        )
+        typed = "这不是网址，只是一段 文字\r\n第二行"
+        status, _, page = self.submit_cover(track["id"], typed)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["cover_url"],
+            "这不是网址，只是一段 文字\n第二行",
+        )
+
+    def test_clearing_cover_saves_empty_string(self):
+        track = self.create_track(
+            title="删空封面", source="/music/clear.flac",
+            cover_url="https://img.example/old.png",
+        )
+        status, _, page = self.submit_cover(track["id"], "")
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        # 主动删空保存为空字符串，不要求补填。
+        self.assertEqual(record["cover_url"], "")
+        self.assertEqual(parse_cover_box(self.get_edit_page(track["id"])), "")
+
+    def test_whitespace_only_submission_saves_empty_string(self):
+        track = self.create_track(
+            title="只剩空白", source="/music/blank.flac",
+            cover_url="https://img.example/old.png",
+        )
+        status, _, page = self.submit_cover(track["id"], "  \r\n \t ")
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], "")
+
+    def test_filling_cover_when_originally_missing(self):
+        # 原本没有封面地址的曲目可以正常补填。
+        track = self.create_track(
+            title="补填封面", source="/music/fill.flac", duration=60,
+        )
+        typed = "https://img.example/补填/第一段\r\n第二段.png"
+        status, _, page = self.submit_cover(track["id"], typed, duration="90")
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(
+            record["cover_url"], "https://img.example/补填/第一段\n第二段.png"
+        )
+        self.assertEqual(record["duration"], 90)
+
+
+class EditPageCoverSaveFailureTest(ServerTestCase):
+    """时长非法或来源冲突导致整单失败：地址完整回填，修正后续存。"""
+
+    TEXTAREA_FIELDS = ("title", "source", "cover_url", "description", "tags")
+    CRLF_COVER = "第一段\r\n第二段\r\n第三段"
+
+    def resubmit_with_browser_newlines(self, fields):
+        return [
+            (name, browser_newlines(value))
+            if name in self.TEXTAREA_FIELDS else (name, value)
+            for name, value in fields
+        ]
+
+    def test_untouched_cover_survives_failure_reprint_and_retry(self):
+        track = self.create_track(
+            title="失败重试", source="/music/retry.flac", duration=120,
+            cover_url=self.CRLF_COVER,
+        )
+        # 用户没碰封面地址框（框内文字按 CRLF 提交），只把时长填成负数。
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.resubmit_with_browser_newlines(fields)
+        fields = self.form_with_field(fields, "duration", "-5")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        # 整条记录保持原样；地址框回填本次提交的文字（LF 呈现），不丢分行。
+        self.assertEqual(self.track_by_id(track["id"]), track)
+        self.assertEqual(
+            parse_cover_box(page), self.CRLF_COVER.replace("\r\n", "\n")
+        )
+        self.assert_form_values(page, duration="-5")
+
+        # 只修正时长后继续保存：未改地址仍保留原 CRLF 原文。
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.resubmit_with_browser_newlines(retry_fields)
+        retry_fields = self.form_with_field(retry_fields, "duration", "240")
+        status, _, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["cover_url"], self.CRLF_COVER)
+        self.assertEqual(record["duration"], 240)
+
+    def test_modified_cover_in_failed_save_is_reprinted_and_saved_on_retry(self):
+        track = self.create_track(
+            title="失败重试", source="/music/retry2.flac", duration=120,
+            cover_url="https://img.example/old.png",
+        )
+        typed = "改过的地址\r\n第二行  art.png"
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.resubmit_with_browser_newlines(fields)
+        fields = self.form_with_field(fields, "cover_url", typed)
+        fields = self.form_with_field(fields, "duration", "-5")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(track["id"]), track)
+        # 确实改过的地址按本次填写回填（LF 呈现，内部空格保留）。
+        self.assertEqual(
+            parse_cover_box(page), "改过的地址\n第二行  art.png"
+        )
+
+        # 只修正时长后继续保存：采用错误页中回填的地址（换行统一为 LF）。
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.resubmit_with_browser_newlines(retry_fields)
+        retry_fields = self.form_with_field(retry_fields, "duration", "240")
+        status, _, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["cover_url"], "改过的地址\n第二行  art.png")
+        self.assertEqual(record["duration"], 240)
+
+    def test_source_conflict_reprints_multiline_cover_then_saves_it(self):
+        occupant = self.create_track(
+            title="占用者", source="/music/taken.flac"
+        )
+        track = self.create_track(
+            title="来源冲突", source="/music/mine.flac", duration=120,
+            cover_url="https://img.example/old.png",
+        )
+        typed_cover = "多行封面\r\n第二行 <b>x</b>"
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.resubmit_with_browser_newlines(fields)
+        fields = self.form_with_field(fields, "source", "/music/taken.flac")
+        fields = self.form_with_field(fields, "cover_url", typed_cover)
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 409, page[:500])
+        self.assertEqual(
+            parse_conflict_items(page), [(occupant["id"], "占用者")]
+        )
+        # 冲突同样整条不保存，本次填写的多行地址完整回填、按普通文字转义。
+        self.assertEqual(self.track_by_id(track["id"]), track)
+        self.assertEqual(parse_cover_box(page), "多行封面\n第二行 <b>x</b>")
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", cover_box_markup(page))
+
+        # 改成未占用的来源后续存：回填的地址随本次保存（换行统一为 LF）。
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.resubmit_with_browser_newlines(retry_fields)
+        retry_fields = self.form_with_field(
+            retry_fields, "source", "/music/free.flac"
+        )
+        status, _, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        record = self.track_by_id(track["id"])
+        self.assertEqual(record["source"], "/music/free.flac")
+        self.assertEqual(record["cover_url"], "多行封面\n第二行 <b>x</b>")
+
+    def test_typed_leading_blank_line_survives_failure_reprint(self):
+        # 用户在地址框开头敲了空行（随其他字段一起被 400 拒绝）：错误页
+        # 必须把开头空行回填在原位，不能被 HTML 解析规则吞掉。
+        track = self.create_track(
+            title="开头空行回填", source="/music/lead.flac", duration=120,
+            cover_url="旧地址",
+        )
+        typed = "\n\n开头两个空行\r\n第二行"
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.resubmit_with_browser_newlines(fields)
+        fields = self.form_with_field(fields, "cover_url", typed)
+        fields = self.form_with_field(fields, "duration", "-5")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(track["id"]), track)
+        self.assertEqual(parse_cover_box(page), "\n\n开头两个空行\n第二行")
+        markup = cover_box_markup(page)
+        # 服务端补写一个开头换行抵消解析吞掉的首换行（共三个）。
+        self.assertIn('rows="4">\n\n\n开头两个空行', markup)
+
+        # 只修正时长后保存：采用回填的地址，首尾空行作为整段首尾空白
+        # 被裁掉，内部换行统一为 LF。
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.resubmit_with_browser_newlines(retry_fields)
+        retry_fields = self.form_with_field(retry_fields, "duration", "240")
+        status, _, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(
+            self.track_by_id(track["id"])["cover_url"], "开头两个空行\n第二行"
+        )
+
+    def test_missing_cover_backfilled_empty_on_failure_then_stays_empty(self):
+        track = self.create_track(
+            title="无封面失败", source="/music/nocover.flac", duration=120,
+        )
+        page = self.get_edit_page(track["id"])
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.resubmit_with_browser_newlines(fields)
+        fields = self.form_with_field(fields, "duration", "-5")
+        status, _, page = self.post_edit_form(track["id"], fields)
+        self.assertEqual(status, 400)
+        # 错误页地址框仍为空，不换回任何旧值。
+        self.assertEqual(parse_cover_box(page), "")
+
+        retry_fields = self.edit_fields_from_rendered_page(page)
+        retry_fields = self.resubmit_with_browser_newlines(retry_fields)
+        retry_fields = self.form_with_field(retry_fields, "duration", "240")
+        status, _, page = self.post_edit_form(track["id"], retry_fields)
+        self.assertEqual(status, 303, page[:500])
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], "")
+
+
+class HomeCreateMultilineCoverTest(ServerTestCase):
+    """首页收录表单的封面地址同样支持多行：保存为 LF，失败时完整回填。"""
+
+    def test_multiline_cover_created_via_form_is_saved_with_lf(self):
+        cover = "地址/第一段\r\n第二行  \r\n\r\n尾段  "
+        fields = self.create_form_fields(
+            title="夜航",
+            source="/音乐/夜航.flac",
+            duration="243.5",
+            cover_url=cover,
+        )
+        status, headers, _ = self.post_create_form(fields)
+        self.assertEqual(status, 303, headers)
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 1)
+        # 只裁掉首尾空白，内部空行与空格保留，换行统一为 LF。
+        self.assertEqual(
+            tracks[0]["cover_url"], "地址/第一段\n第二行  \n\n尾段"
+        )
+        self.assertNotIn("\r", tracks[0]["cover_url"])
+        # 打开编辑页逐行可见。
+        page = self.get_edit_page(tracks[0]["id"])
+        self.assertEqual(
+            parse_cover_box(page), "地址/第一段\n第二行  \n\n尾段"
+        )
+
+    def test_failed_create_reprints_multiline_cover(self):
+        # 名称只填空白导致失败：多行地址（含引号、尖括号）完整回填。
+        cover = 'https://img.example/<b>x</b>\n第二行 "引号"'
+        fields = self.create_form_fields(
+            title=" \t ",
+            source="/music/x.flac",
+            cover_url=cover.replace("\n", "\r\n"),
+        )
+        status, _, page = self.post_create_form(fields)
+        self.assertEqual(status, 400)
+        self.assertEqual(parse_cover_box(page), cover)
+        markup = cover_box_markup(page)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", markup)
+        self.assertNotIn("<b>x</b>", markup)
+        self.assertEqual(self.list_tracks(), [])
+
+        # 只修正名称后保存，采用回填的多行地址（换行统一为 LF）。
+        retry_fields = self.create_fields_from_rendered_page(page)
+        retry_fields = self.form_with_field(retry_fields, "title", "修正名称")
+        retry_fields = [
+            (name, browser_newlines(value))
+            if name in ("title", "source", "cover_url", "description")
+            else (name, value)
+            for name, value in retry_fields
+        ]
+        status, headers, _ = self.post_create_form(retry_fields)
+        self.assertEqual(status, 303, headers)
+        self.assertEqual(self.list_tracks()[0]["cover_url"], cover)
 
 
 class SourceApiNewlinePreservationTest(ServerTestCase):
