@@ -70,6 +70,22 @@
   实际占用该来源的记录；冲突后任何记录都不被改动，可换来源直接重试。
 - 只有标识与名称、来源缺失的旧记录：省略来源可正常编辑且不参与判重；
   补填已被占用的来源同样适用拒绝保存规则。
+- 来源（PATCH source，直接提交 JSON）：省略 source 时原来源逐字保留，
+  只修改说明等其他合法资料照常返回 200 与原标识下的完整曲目，即使其他
+  版本共用同一来源也不误判冲突；只有标识与名称、尚未填写来源的旧记录
+  同样允许省略来源编辑，响应与列表中的来源继续为 null。明确提交空
+  字符串、只含空格/制表符/换行的字符串或 JSON null 时返回 400，field
+  指向 source，错误文字说明来源不能清空；提交数字、布尔值、数组或对象
+  同样返回 400，错误文字说明来源必须是字符串，数字不会转成来源文字，
+  false 也不能当作未提交。这些失败请求即使同时带有合法的新名称、时长
+  和说明也不保存其中任何一项：目标记录的完整资料（中文说明、说明中的
+  空行、标签文字与顺序）仍是提交前内容，记录数量与按标识升序的列表
+  次序不变；同一来源已有多个独立版本时，拒绝其中一条的非法来源修改
+  不改变其他版本或无关曲目。旧记录明确提交空白来源或 null 同样按无效
+  输入拒绝，不与省略字段混为一谈。非法提交被拒绝后，向同一标识提交
+  尚未被使用的合法来源可正常更新：来源只裁掉整段首尾空白，内部空格与
+  换行保留，成功响应与列表读到的资料一致，未再次提交的失败改动不会被
+  补入。
 - 时长（PATCH duration）：改成 0 或有限的非负小数时，成功响应中的时长
   与之后读取曲目列表得到的值一致，不做换算、舍入或自动纠错；只有明确
   提交 null 才把时长改成未知，0 仍然是已知的数字时长；只改名称或说明、
@@ -956,6 +972,256 @@ class LegacyTrackEditTest(ServerTestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["source"], "/music/legacy-filled.flac")
         self.assertEqual(body["title"], "旧记录·甲")
+
+
+class EditSourceOmitApiTest(ServerTestCase):
+    """PATCH 省略 source：原来源逐字保留，共用来源的版本互不妨碍。"""
+
+    def setUp(self):
+        super().setUp()
+        # 两个独立版本共用同一段来源文字（含内部空格与换行）。
+        self.shared_source = "/music/夜航 现场版\n第二行.flac"
+        self.first = self.create_track(
+            title="夜航·首版",
+            source=self.shared_source,
+            duration=243.5,
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source=self.shared_source,
+            duration=250,
+            description="重制说明",
+            tags=["民谣", "重制"],
+            save_as_new_version=True,
+        )
+
+    def test_omit_source_with_valid_description_edit_succeeds(self):
+        status, body = self.patch(self.second["id"], {
+            "description": "只改说明\n\n第二段",
+        })
+        self.assertEqual(status, 200, body)
+        # 返回原标识下的完整曲目，来源逐字保留（含内部空格与换行），
+        # 不因首版共用同一来源而拒绝保存。
+        self.assertEqual(body, {
+            "id": self.second["id"],
+            "title": "夜航·重制",
+            "source": self.shared_source,
+            "duration": 250,
+            "cover_url": "",
+            "description": "只改说明\n\n第二段",
+            "tags": ["民谣", "重制"],
+        })
+        # 成功响应与列表读到的资料一致；共用来源的首版不受影响，
+        # 记录数量与按标识升序的列表次序不变。
+        self.assertEqual(self.track_by_id(self.second["id"]), body)
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.first["id"], self.second["id"]],
+        )
+
+
+class EditSourceInvalidApiTest(ServerTestCase):
+    """PATCH 提交非法来源：400 且 field=source，整单失败，任何记录不变。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="山涧晨曲",
+            source="/music/shanjian.flac",
+            duration=212,
+            cover_url="https://img.example/shanjian.png",
+            description="清晨山涧录音\n\n第二段：鸟鸣",
+            tags=["纯音乐", "现场", "晨录"],
+        )
+        self.track_id = self.track["id"]
+        # 同一来源的另一个独立版本：拒绝其中一条的非法修改不能波及它。
+        self.other_version = self.create_track(
+            title="山涧晨曲·重制",
+            source="/music/shanjian.flac",
+            duration=220,
+            description="重制版说明",
+            tags=["纯音乐", "重制"],
+            save_as_new_version=True,
+        )
+        # 无关曲目用于证明拒绝不影响其他记录。
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+        )
+
+    def assert_source_rejected(self, bad_source, expected_text):
+        """非法来源（连同合法的新名称、时长、说明一起提交）必须整单失败。"""
+        status, body = self.patch(self.track_id, {
+            "title": "不应保存的新名称",
+            "source": bad_source,
+            "duration": 300,
+            "description": "不应保存的新说明",
+        })
+        self.assertEqual(status, 400, body)
+        # 可读取的 JSON 错误：field 指向 source，文字说明来源为何不合法。
+        self.assertEqual(body["field"], "source")
+        self.assertIn("来源", body["error"])
+        self.assertIn(expected_text, body["error"])
+
+    def assert_everything_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量不变，列表仍按标识升序。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.other_version["id"], self.bystander["id"]],
+        )
+        # 目标曲目的完整资料仍是提交前内容：中文说明、说明中的空行、
+        # 标签文字与顺序都保留；同次请求里合法的新名称、时长、说明
+        # 没有保存其中任何一项。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 同一来源的其他版本与无关曲目都不受影响。
+        self.assertEqual(
+            self.track_by_id(self.other_version["id"]), self.other_version
+        )
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_empty_string_is_rejected(self):
+        self.assert_source_rejected("", "不能清空")
+        self.assert_everything_unchanged()
+
+    def test_whitespace_only_strings_are_rejected(self):
+        for bad in ("   ", "\t\t", "\n\n", " \t\n\r\n "):
+            with self.subTest(bad=bad):
+                self.assert_source_rejected(bad, "不能清空")
+                self.assert_everything_unchanged()
+
+    def test_null_is_rejected(self):
+        # JSON 的 null 是明确提交，不等于省略 source 字段。
+        self.assert_source_rejected(None, "不能清空")
+        self.assert_everything_unchanged()
+
+    def test_numbers_are_rejected_without_coercion(self):
+        # 数字不能转成来源文字。
+        for bad in (0, 243, 4.5):
+            with self.subTest(bad=bad):
+                self.assert_source_rejected(bad, "必须是字符串")
+                self.assert_everything_unchanged()
+
+    def test_booleans_are_rejected(self):
+        # false 是明确提交的非法值，不能当作未提交来源。
+        for bad in (True, False):
+            with self.subTest(bad=bad):
+                self.assert_source_rejected(bad, "必须是字符串")
+                self.assert_everything_unchanged()
+
+    def test_arrays_and_objects_are_rejected(self):
+        for bad in ([], ["/music/shanjian.flac"], {}, {"path": "/music/x"}):
+            with self.subTest(bad=bad):
+                self.assert_source_rejected(bad, "必须是字符串")
+                self.assert_everything_unchanged()
+
+    def test_invalid_source_alone_is_rejected(self):
+        # 即使同次请求没有夹带其他字段，拒绝规则相同。
+        status, body = self.patch(self.track_id, {"source": ""})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "source")
+        self.assert_everything_unchanged()
+
+
+class EditSourceLegacyApiTest(ServerTestCase):
+    """尚未填写来源的旧记录：省略来源可编辑，明确提交空白或 null 仍拒绝。"""
+
+    def setUp(self):
+        super().setUp()
+        self.legacy_id = self.server.insert_legacy("旧记录·只有名称")
+        self.normal = self.create_track(
+            title="正常曲目", source="/music/normal.flac",
+        )
+
+    def test_omit_source_succeeds_and_source_stays_null(self):
+        status, body = self.patch(self.legacy_id, {
+            "description": "补写的说明",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.legacy_id)
+        # 返回与列表中的来源继续为 null，不与任何记录判重。
+        self.assertIsNone(body["source"])
+        self.assertEqual(body["description"], "补写的说明")
+        record = self.track_by_id(self.legacy_id)
+        self.assertIsNone(record["source"])
+        self.assertEqual(record["description"], "补写的说明")
+
+    def test_explicit_blank_source_is_rejected(self):
+        for bad in ("", "   ", "\t\n"):
+            with self.subTest(bad=bad):
+                status, body = self.patch(self.legacy_id, {
+                    "source": bad,
+                    "description": "不应保存的说明",
+                })
+                self.assertEqual(status, 400, body)
+                self.assertEqual(body["field"], "source")
+                self.assertIn("不能清空", body["error"])
+                # 旧记录保持提交前状态：来源仍缺失，说明没有写入。
+                record = self.track_by_id(self.legacy_id)
+                self.assertIsNone(record["source"])
+                self.assertEqual(record["title"], "旧记录·只有名称")
+                self.assertEqual(record["description"], "")
+
+    def test_explicit_null_source_is_rejected(self):
+        # 明确提交 null 与省略 source 字段不能混为一谈。
+        status, body = self.patch(self.legacy_id, {
+            "source": None,
+            "description": "不应保存的说明",
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "source")
+        self.assertIn("不能清空", body["error"])
+        record = self.track_by_id(self.legacy_id)
+        self.assertIsNone(record["source"])
+        self.assertEqual(record["description"], "")
+
+
+class EditSourceRetryAfterRejectionTest(ServerTestCase):
+    """非法来源被拒后，换用尚未使用的合法来源可正常更新同一标识。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="待改来源",
+            source="/music/old.flac",
+            duration=100,
+            description="原始说明",
+            tags=["原始"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_valid_source_retry_after_rejection(self):
+        # 先提交非法来源：整单失败，夹带的合法修改也不保存。
+        status, body = self.patch(self.track_id, {
+            "title": "不应保存的新名称",
+            "source": "   ",
+            "duration": 300,
+            "description": "不应保存的新说明",
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "source")
+
+        # 随后只提交尚未被使用的合法来源：正常更新同一标识。
+        # 来源只裁掉整段首尾空白，内部空格与换行保留。
+        status, body = self.patch(self.track_id, {
+            "source": "  /music/新 来源\n第二行.flac\t\n",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "待改来源",
+            "source": "/music/新 来源\n第二行.flac",
+            "duration": 100,
+            "cover_url": "",
+            "description": "原始说明",
+            "tags": ["原始"],
+        })
+        # 成功响应与列表读到的资料一致；失败请求里没有再次提交的
+        # 名称、时长、说明改动不会被补入，也不新增记录。
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(len(self.list_tracks()), 1)
 
 
 class EditDurationValidTest(ServerTestCase):
