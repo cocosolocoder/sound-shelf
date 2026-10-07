@@ -444,6 +444,73 @@ def duration_to_text(value):
 FORM_FIELDS = ("title", "source", "duration", "cover_url", "description", "tags")
 
 
+def search_keyword_from_query(query):
+    """取首页搜索框实际采用的关键词。
+
+    取 q 的第一个值并去掉首尾空白；缺失或只剩空白时返回空串，表示
+    不筛选。内部空格与标点（含 %、_、引号、尖括号）都是搜索内容，
+    不做任何转义或特殊解释。
+    """
+    return query.get("q", [""])[0].strip()
+
+
+def track_matches_keyword(record, keyword):
+    """判断一条曲目是否包含关键词。
+
+    名称、来源、说明与每个标签按各项完整文字独立判断，任一项内部
+    连续出现关键词即命中，不要求同时命中多项，也不把多个字段或
+    多个标签拼起来凑一次命中。封面地址与时长不参加搜索；来源缺失
+    （旧记录）、空说明、空标签都没有可匹配的文字，页面上的“未填写”
+    “无”等占位提示不是资料。中文按原文字匹配，英文字母按不区分
+    大小写方式比较；匹配的是连续文字而非整项相等。
+    """
+    needle = keyword.casefold()
+    searchable = [record["title"], record["source"], record["description"]]
+    searchable.extend(record["tags"])
+    return any(
+        text is not None and text != "" and needle in text.casefold()
+        for text in searchable
+    )
+
+
+def filter_tracks_by_keyword(tracks, keyword):
+    """按关键词筛选曲目；关键词为空时原样返回完整列表。
+
+    名称相同的记录、同一来源另存的多个版本都是独立记录，各自参加
+    匹配，不做合并；结果保持传入的标识升序顺序。
+    """
+    if not keyword:
+        return list(tracks)
+    return [record for record in tracks if track_matches_keyword(record, keyword)]
+
+
+def render_search_form(keyword, *, found, total):
+    """渲染曲目列表上方的关键词查找表单与结果计数。
+
+    表单用 GET 提交，条件留在网址中，重新打开同一地址仍是同样条件
+    下的当前结果；输入框回填实际采用的关键词（已转义）。存在筛选
+    条件时显示命中数量与曲库总数，并提供“清除搜索”入口。
+    """
+    clear = ""
+    summary = ""
+    if keyword:
+        clear = ' <a class="search-clear" href="/">清除搜索</a>'
+        summary = (
+            f'<p class="search-summary">找到 <strong>{found}</strong> 首'
+            f"符合关键词的曲目，曲库共 {total} 首。</p>"
+        )
+    return (
+        '<form class="track-search" method="get" action="/">\n'
+        '  <label for="f-q">关键词</label>\n'
+        f'  <input type="text" id="f-q" name="q" value="{esc(keyword)}">\n'
+        '  <button type="submit">查找</button>\n'
+        f"  {clear}\n"
+        '  <span class="hint">在名称、来源、说明和每个标签的完整文字中'
+        "查找连续文字；英文字母不区分大小写</span>\n"
+        f"</form>\n{summary}"
+    )
+
+
 def render_track_form(form, error, error_field, *, action, submit_label,
                       edit_mode=False):
     """渲染收录/编辑共用的曲目表单。
@@ -565,9 +632,12 @@ def render_track_form(form, error, error_field, *, action, submit_label,
 
 def render_page(tracks, *, form=None, error=None, error_field=None,
                 conflicts=None, highlight=None, edit_track=None,
-                edit_not_found=None, edited=False):
+                edit_not_found=None, edited=False,
+                search_keyword="", total_count=None):
     form = form or {}
     edit_mode = edit_track is not None
+    if total_count is None:
+        total_count = len(tracks)
 
     error_html = ""
     if error:
@@ -618,13 +688,26 @@ def render_page(tracks, *, form=None, error=None, error_field=None,
         )
         form_heading = '<h2 id="add">手动收录曲目</h2>'
 
+    search_html = ""
+    if not edit_mode:
+        search_html = render_search_form(
+            search_keyword, found=len(tracks), total=total_count
+        )
+
     if tracks:
         items = "".join(render_track(record, highlight) for record in tracks)
         listing = f'<ol class="tracks">{items}</ol>'
-    else:
+    elif total_count == 0:
         listing = (
             '<p class="empty">还没有曲目记录。'
             "使用下方表单手动收录第一首曲目吧。</p>"
+        )
+    else:
+        # 曲库中本有曲目，只是当前关键词没有任何命中：保留搜索条件，
+        # 并通过搜索表单上的“清除搜索”恢复完整列表。
+        listing = (
+            '<p class="empty">没有符合关键词的曲目。'
+            "可更换关键词，或清除搜索后查看全部曲目。</p>"
         )
 
     highlight_notice = ""
@@ -691,6 +774,12 @@ ol.tracks li.highlight{{border-color:#1769aa;box-shadow:0 0 0 2px rgba(23,105,17
 form.track-form button.tag-remove{{margin:0;white-space:nowrap;align-self:center;padding:.3rem .7rem;font-size:.88em;border:1px solid #b3261e;background:#fff;color:#b3261e;cursor:pointer}}
 form.track-form button.tag-add{{margin-top:.6rem;padding:.35rem .9rem;font-size:.92em;border:1px solid #14507a;background:#fff;color:#1769aa;cursor:pointer}}
 .track-actions{{margin:.6rem 0 0;font-size:.95em}}
+form.track-search{{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:1rem 0}}
+form.track-search label{{font-weight:600}}
+form.track-search input[type=text]{{flex:1 1 14rem;min-width:10rem;padding:.45rem .6rem;border:1px solid #bcccdc;border-radius:4px;font:inherit}}
+form.track-search button{{padding:.45rem 1.1rem;font:inherit;border-radius:5px;border:1px solid #14507a;background:#1769aa;color:#fff;cursor:pointer}}
+.search-clear{{white-space:nowrap}}
+.search-summary{{margin:.2rem 0 .8rem;color:#627d98}}
 </style>
 <main>
 <h1>{PRODUCT}</h1>
@@ -702,6 +791,7 @@ form.track-form button.tag-add{{margin-top:.6rem;padding:.35rem .9rem;font-size:
 {error_html}
 {form_html}
 <h2>曲目列表</h2>
+{search_html}
 {listing}
 <p><a href="/api/tracks">查看曲目列表接口</a> · <a href="/health">服务状态</a></p>
 </main>
@@ -1024,9 +1114,21 @@ def main():
             if raw_highlight.isdigit():
                 highlight = int(raw_highlight)
             edited = query.get("edited", [""])[0] in ("1", "true", "yes")
+            # 关键词只筛选首页列表：接口仍返回全部记录，这里也不写库。
+            # 去掉首尾空白后的实际关键词同时用于匹配与输入框回填；
+            # 留空或只有空白等同于不筛选，仍显示完整列表与原顺序。
+            keyword = search_keyword_from_query(query)
+            all_tracks = list_tracks(database)
+            tracks = filter_tracks_by_keyword(all_tracks, keyword)
             self.respond(
                 200,
-                render_page(list_tracks(database), highlight=highlight, edited=edited),
+                render_page(
+                    tracks,
+                    highlight=highlight,
+                    edited=edited,
+                    search_keyword=keyword,
+                    total_count=len(all_tracks),
+                ),
                 html=True,
             )
 
