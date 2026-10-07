@@ -199,6 +199,21 @@
   名称合法但时长非法时同样 400 且不写入，错误页完整保留本次多行名称，
   只修正时长后保存采用错误页中的名称。首页收录表单的名称框同样支持
   多行，保存时换行统一为 LF。
+- 请求体格式（PATCH /api/tracks/{id}）：目标曲目存在时，空请求体、缺少
+  结尾的 JSON、夹有多余文字的 JSON、不能按 UTF-8 解码的请求内容都返回 400
+  与可读取的 JSON 错误（“请求体不是有效的 JSON”），不出现连接突然断开或
+  保存成功；能够解析成 JSON 但顶层是数组、字符串、数字、布尔值或 null 时也
+  返回 400，但错误说明资料必须是 JSON 对象且 field 为 null，不把问题归给
+  名称、时长等某个字段，也不保存其中的内容（数组不会当成标签、字符串不会
+  当成名称）。两类 400 必须可由错误文字与 field 区分。失败后读取列表，目标
+  曲目、同一来源的其他独立版本与其他曲目的标识、完整资料（含说明中的中文与
+  空行、标签的完整文字和先后关系）、数量与次序都与提交前一致；被拒绝的编辑
+  内容不会在后续合法请求中自动补入，实际保存只采用后一次请求明确提交的资料。
+  不存在的普通数字标识：无法解析的请求体先返回 400 的 JSON 格式错误；请求体
+  能解析时即使顶层不是对象也返回 404 并说明曲目不存在，不继续报告字段错误。
+  对照：空对象 {} 返回 200 且原记录完整保留，与空请求体的 400 明确区分；提交
+  部分资料返回 200 与更新后的完整曲目，只改变明确提交的字段。上述失败后列表
+  仍能正常读取，已有曲目仍能接受合法编辑。
 
 运行：python3 -m unittest test_app -v
 """
@@ -8635,6 +8650,374 @@ class EditCoverApiInvalidTypeTest(ServerTestCase):
             self.track_by_id(self.track_id)["cover_url"],
             "https://img.example/yehang.png",
         )
+
+
+class _BadRequestBodyFixture(ServerTestCase):
+    """请求体格式回归的共同夹具：资料丰富的目标曲目、同来源独立版本、
+    无关曲目各一条；任何失败后整个列表都必须与快照逐字一致。"""
+
+    def setUp(self):
+        super().setUp()
+        # 目标曲目：说明含中文、段落间空行与结尾空行；标签含内部空格、
+        # 中英文逗号/顿号与项内换行，先后关系也是要保留的资料。
+        self.track_v1 = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="第一段说明\n\n第二段：含中文与标点！\n\n",
+            tags=["民谣", "现场  录音", "逗号,标签", "顿号、标签", "多行\n标签"],
+        )
+        self.track_id = self.track_v1["id"]
+        # 同一来源的另一个独立版本：失败后它的资料也必须逐字保持原样。
+        self.track_v2 = self.create_track(
+            title="夜航（现场版）",
+            source="/music/yehang.flac",
+            duration=300,
+            description="第二版说明\n\n版本二空行后的文字",
+            tags=["版本二", "民谣"],
+            save_as_new_version=True,
+        )
+        # 不同来源的无关曲目，用于核对数量、次序与其他记录不受影响。
+        self.bystander = self.create_track(
+            title="无关曲目",
+            source="/music/other.flac",
+            duration=7,
+            description="其他来源的说明",
+            tags=["其他"],
+        )
+        self.expected = self.list_tracks()
+        self.expected_ids = [record["id"] for record in self.expected]
+
+    def patch_bytes(self, track_id, raw):
+        """按原始字节发送 PATCH 请求体（可含空体或非 UTF-8 字节）。"""
+        status, headers, body = self.server.raw_request(
+            "PATCH", f"/api/tracks/{track_id}", body=raw,
+            content_type="application/json",
+        )
+        return status, headers, body
+
+    def assert_library_unchanged(self):
+        """失败后列表的标识、完整资料、数量与次序都与提交前一致。"""
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [record["id"] for record in tracks], self.expected_ids,
+            "失败后曲目标识或次序发生变化",
+        )
+        self.assertEqual(len(tracks), len(self.expected), "失败后记录数量发生变化")
+        self.assertEqual(tracks, self.expected, "失败后曲目资料发生变化")
+
+    def assert_malformed_json_rejected(self, raw):
+        """无法解析的请求体：400、完整可读的 JSON、只报请求体不是有效 JSON。"""
+        status, headers, body = self.patch_bytes(self.track_id, raw)
+        self.assertEqual(status, 400, body)
+        # 响应完整可读：Content-Type 是 JSON，Content-Length 与实际字节一致，
+        # 体可以整体解析（连接没有被突然断开）。
+        self.assertTrue(
+            headers["Content-Type"].startswith("application/json"),
+            headers["Content-Type"],
+        )
+        self.assertEqual(
+            int(headers["Content-Length"]), len(body),
+            "响应在传输完成前被截断（连接突然断开）",
+        )
+        parsed = json.loads(body.decode("utf-8"))
+        self.assertEqual(parsed, {"error": "请求体不是有效的 JSON"})
+        self.assert_library_unchanged()
+
+    def assert_non_object_rejected(self, raw):
+        """可解析但非对象的请求体：400、要求 JSON 对象、field 为 null。"""
+        status, headers, body = self.patch_bytes(self.track_id, raw)
+        self.assertEqual(status, 400, body)
+        self.assertTrue(
+            headers["Content-Type"].startswith("application/json"),
+            headers["Content-Type"],
+        )
+        self.assertEqual(int(headers["Content-Length"]), len(body))
+        parsed = json.loads(body.decode("utf-8"))
+        self.assertEqual(parsed["error"], "请求体必须是 JSON 对象")
+        # 不把问题归给名称、时长等某个字段。
+        self.assertIsNone(parsed["field"])
+        self.assertEqual(set(parsed), {"error", "field"})
+        self.assert_library_unchanged()
+
+
+class EditMalformedJsonBodyTest(_BadRequestBodyFixture):
+    """目标曲目存在时，无法解析的请求体一律 400，且不保存任何内容。"""
+
+    # (说明, 原始字节)：空体、缺少结尾、夹多余文字、非 UTF-8 内容。
+    MALFORMED_BODIES = [
+        ("empty_body", b""),
+        ("truncated_object", b'{"title":'),
+        ("truncated_array_value", b'{"tags":["\xe6\xb0\x91\xe8\xb0\xa3"]'),
+        ("trailing_chinese_junk", b'{"duration":12}\xe5\xa4\x9a\xe4\xbd\x99'),
+        ("leading_chinese_junk", b'\xe5\xba\x8f{"duration":12}'),
+        ("two_json_documents", b'{"duration":12}{"duration":13}'),
+        ("invalid_utf8_in_string", b'{"title":"\xff\xfe"}'),
+        ("lone_invalid_byte", b"\xff"),
+        ("truncated_utf8_sequence", b'{"description":"\xe5\xa4'),
+    ]
+
+    def test_malformed_bodies_return_400_readable_json(self):
+        for label, raw in self.MALFORMED_BODIES:
+            with self.subTest(body=label):
+                self.assert_malformed_json_rejected(raw)
+
+    def test_response_is_complete_json_not_dropped_connection(self):
+        # 每种畸形体都必须拿到完整响应，不能出现连接突然断开。
+        for label, raw in self.MALFORMED_BODIES:
+            with self.subTest(body=label):
+                status, headers, body = self.patch_bytes(self.track_id, raw)
+                self.assertEqual(status, 400)
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+                self.assertTrue(body, "空响应无法告诉调用者请求体不是有效 JSON")
+                json.loads(body.decode("utf-8"))
+
+    def test_json_error_is_distinct_from_object_type_error(self):
+        # 调用者必须能区分“请求体格式错误”和“资料类型错误”：
+        # 前者只有 error，后者额外带 field=null。
+        status, _, malformed = self.patch_bytes(self.track_id, b'{"title":')
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(malformed), {"error": "请求体不是有效的 JSON"}
+        )
+        status, _, non_object = self.patch_bytes(self.track_id, b'["x"]')
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(non_object),
+            {"error": "请求体必须是 JSON 对象", "field": None},
+        )
+
+    def test_no_success_even_when_body_text_mentions_fields(self):
+        # 畸形体里即使写着看似合法的字段内容，也不能出现保存成功。
+        for label, raw in self.MALFORMED_BODIES:
+            with self.subTest(body=label):
+                status, _, _ = self.patch_bytes(self.track_id, raw)
+                self.assertEqual(status, 400)
+        self.assertEqual(self.track_by_id(self.track_id), self.track_v1)
+
+    def test_rich_text_and_both_versions_kept_after_all_failures(self):
+        for _, raw in self.MALFORMED_BODIES:
+            self.assert_malformed_json_rejected(raw)
+        tracks = {record["id"]: record for record in self.list_tracks()}
+        # 目标曲目与同一来源的独立版本各自保持原样：说明中的中文与空行、
+        # 标签的完整文字和先后关系都在。
+        self.assertEqual(tracks[self.track_v1["id"]], self.track_v1)
+        self.assertEqual(tracks[self.track_v2["id"]], self.track_v2)
+        self.assertEqual(tracks[self.bystander["id"]], self.bystander)
+        target = tracks[self.track_id]
+        self.assertEqual(
+            target["description"], "第一段说明\n\n第二段：含中文与标点！\n\n"
+        )
+        self.assertEqual(
+            target["tags"],
+            ["民谣", "现场  录音", "逗号,标签", "顿号、标签", "多行\n标签"],
+        )
+
+
+class EditNonObjectJsonBodyTest(_BadRequestBodyFixture):
+    """能解析成 JSON 但顶层不是对象：400 且 field=null，不保存任何内容。"""
+
+    NON_OBJECT_BODIES = [
+        ("array_with_mixed_items", b'["\xe4\xb8\x8d\xe5\xba\x94\xe4\xbf\x9d\xe5\xad\x98", 1]'),
+        ("empty_array", b"[]"),
+        ("string", b'"\xe4\xb8\x8d\xe5\xba\x94\xe4\xbf\x9d\xe5\xad\x98\xe7\x9a\x84\xe5\x90\x8d\xe7\xa7\xb0"'),
+        ("empty_string", b'""'),
+        ("integer", b"42"),
+        ("decimal", b"12.5"),
+        ("negative_number", b"-3"),
+        ("true", b"true"),
+        ("false", b"false"),
+        ("null", b"null"),
+    ]
+
+    def test_non_object_bodies_return_400_with_null_field(self):
+        for label, raw in self.NON_OBJECT_BODIES:
+            with self.subTest(body=label):
+                self.assert_non_object_rejected(raw)
+
+    def test_error_is_about_object_shape_not_any_field(self):
+        for label, raw in self.NON_OBJECT_BODIES:
+            with self.subTest(body=label):
+                status, _, body = self.patch_bytes(self.track_id, raw)
+                self.assertEqual(status, 400)
+                parsed = json.loads(body)
+                self.assertIn("JSON 对象", parsed["error"])
+                for field_label in ("名称", "来源", "时长", "说明", "标签", "封面"):
+                    self.assertNotIn(field_label, parsed["error"])
+                self.assertIsNone(parsed["field"])
+
+    def test_bare_string_is_not_saved_as_title(self):
+        self.assert_non_object_rejected(b'"\xe5\xa4\x9c\xe8\x88\xaa\xef\xbc\x88\xe6\x96\xb0\xe7\x89\x88\xef\xbc\x89"')
+        self.assertEqual(
+            self.track_by_id(self.track_id)["title"], self.track_v1["title"]
+        )
+
+    def test_bare_array_is_not_saved_as_tags(self):
+        self.assert_non_object_rejected(b'["\xe6\x96\xb0\xe6\xa0\x87\xe7\xad\xbeA", "\xe6\x96\xb0\xe6\xa0\x87\xe7\xad\xbeB"]')
+        self.assertEqual(
+            self.track_by_id(self.track_id)["tags"], self.track_v1["tags"]
+        )
+
+    def test_bare_number_is_not_saved_as_duration(self):
+        self.assert_non_object_rejected(b"300")
+        self.assertEqual(
+            self.track_by_id(self.track_id)["duration"],
+            self.track_v1["duration"],
+        )
+
+    def test_bare_null_clears_nothing(self):
+        self.assert_non_object_rejected(b"null")
+        self.assertEqual(self.track_by_id(self.track_id), self.track_v1)
+
+    def test_both_versions_kept_after_all_non_object_failures(self):
+        for _, raw in self.NON_OBJECT_BODIES:
+            self.assert_non_object_rejected(raw)
+        tracks = {record["id"]: record for record in self.list_tracks()}
+        self.assertEqual(tracks[self.track_v1["id"]], self.track_v1)
+        self.assertEqual(tracks[self.track_v2["id"]], self.track_v2)
+        self.assertEqual(tracks[self.bystander["id"]], self.bystander)
+
+
+class EditInvalidBodyPersistenceTest(_BadRequestBodyFixture):
+    """失败后资料保留、失败内容不补入，以及空体/空对象/部分修改的对照。"""
+
+    def test_rejected_edits_are_not_merged_into_later_valid_patch(self):
+        # 畸形体与裸字符串都试图改名/改时长，必须全部被拒。
+        self.assert_malformed_json_rejected(
+            b'{"title":"\xe4\xb8\x8d\xe5\xba\x94\xe4\xbf\x9d\xe5\xad\x98\xe7\x9a\x84\xe5\x90\x8d\xe7\xa7\xb0","duration":300,'
+        )
+        self.assert_non_object_rejected(
+            b'"\xe4\xb9\x9f\xe4\xb8\x8d\xe5\xba\x94\xe4\xbf\x9d\xe5\xad\x98\xe7\x9a\x84\xe5\x90\x8d\xe7\xa7\xb0"'
+        )
+        # 之后的合法请求只提交标签：被拒绝的名称、时长不会自动补入，
+        # 实际保存只采用本次明确提交的资料。
+        status, body = self.patch(self.track_id, {"tags": ["只有本次明确提交的标签"]})
+        self.assertEqual(status, 200, body)
+        current = self.track_by_id(self.track_id)
+        self.assertEqual(current["tags"], ["只有本次明确提交的标签"])
+        self.assertEqual(current["title"], self.track_v1["title"])
+        self.assertEqual(current["duration"], self.track_v1["duration"])
+        self.assertEqual(current["source"], self.track_v1["source"])
+        self.assertEqual(current["cover_url"], self.track_v1["cover_url"])
+        self.assertEqual(current["description"], self.track_v1["description"])
+        tracks = {record["id"]: record for record in self.list_tracks()}
+        self.assertEqual(tracks[self.track_v2["id"]], self.track_v2)
+        self.assertEqual(tracks[self.bystander["id"]], self.bystander)
+
+    def test_empty_body_is_400_but_empty_object_is_200_and_keeps_record(self):
+        # 空请求体与空对象必须有各自明确的结果。
+        status, _, body = self.patch_bytes(self.track_id, b"")
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(body), {"error": "请求体不是有效的 JSON"}
+        )
+        status, body = self.patch(self.track_id, {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, self.track_v1)
+        self.assertEqual(self.track_by_id(self.track_id), self.track_v1)
+
+    def test_partial_payload_after_failures_changes_only_submitted_field(self):
+        self.assert_malformed_json_rejected(b'{"duration":')
+        self.assert_non_object_rejected(b"true")
+        status, body = self.patch(self.track_id, {"description": "新的说明"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual(body["description"], "新的说明")
+        # 未提交的字段保留原值。
+        self.assertEqual(body["title"], self.track_v1["title"])
+        self.assertEqual(body["source"], self.track_v1["source"])
+        self.assertEqual(body["duration"], self.track_v1["duration"])
+        self.assertEqual(body["cover_url"], self.track_v1["cover_url"])
+        self.assertEqual(body["tags"], self.track_v1["tags"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
+
+    def test_list_readable_and_track_editable_after_every_failure(self):
+        for _, raw in EditMalformedJsonBodyTest.MALFORMED_BODIES:
+            status, _, _ = self.patch_bytes(self.track_id, raw)
+            self.assertEqual(status, 400)
+        for _, raw in EditNonObjectJsonBodyTest.NON_OBJECT_BODIES:
+            status, _, _ = self.patch_bytes(self.track_id, raw)
+            self.assertEqual(status, 400)
+        # 失败之后列表仍能正常读取。
+        self.assertEqual(self.list_tracks(), self.expected)
+        # 已有曲目仍能接受合法编辑。
+        status, body = self.patch(self.track_id, {"duration": 0})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 0)
+        self.assertEqual(body["title"], self.track_v1["title"])
+
+
+class EditNonexistentIdBodyOrderingTest(ServerTestCase):
+    """不存在的普通数字标识：先判请求体格式，能解析再返回 404。"""
+
+    def setUp(self):
+        super().setUp()
+        self.existing = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            description="说明\n\n第二段",
+            tags=["民谣"],
+        )
+        self.missing_id = self.existing["id"] + 1000
+
+    def patch_bytes(self, raw):
+        return self.server.raw_request(
+            "PATCH", f"/api/tracks/{self.missing_id}", body=raw,
+            content_type="application/json",
+        )
+
+    def test_unparseable_body_reports_json_error_before_not_found(self):
+        for raw in (
+            b"",
+            b'{"title":',
+            b'{"x":}\xff',
+            b'{"title":"\xff\xfe"}',
+            b"\xff",
+        ):
+            with self.subTest(raw=raw):
+                status, headers, body = self.patch_bytes(raw)
+                self.assertEqual(status, 400, body)
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+                self.assertEqual(
+                    json.loads(body), {"error": "请求体不是有效的 JSON"}
+                )
+
+    def test_parseable_body_returns_404_even_when_top_level_not_object(self):
+        # 请求体能够解析时，即使顶层不是对象，也只报曲目不存在，
+        # 不继续报告字段/类型错误。
+        for raw in (b"{}", b'{"title":"x"}', b"[]", b'"x"', b"42", b"true", b"null"):
+            with self.subTest(raw=raw):
+                status, headers, body = self.patch_bytes(raw)
+                self.assertEqual(status, 404, body)
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+                parsed = json.loads(body)
+                self.assertEqual(
+                    parsed, {"error": f"曲目 #{self.missing_id} 不存在"}
+                )
+                self.assertNotIn("field", parsed)
+
+    def test_not_found_response_is_complete_json(self):
+        status, headers, body = self.patch_bytes(b'{"title":"x"}')
+        self.assertEqual(status, 404)
+        self.assertTrue(
+            headers["Content-Type"].startswith("application/json"),
+            headers["Content-Type"],
+        )
+        json.loads(body)
+
+    def test_probes_leave_real_record_untouched_and_editable(self):
+        for raw in (b"", b'{"title":', b"[]", b"null", b'{"title":"x"}'):
+            self.patch_bytes(raw)
+        self.assertEqual(self.list_tracks(), [self.existing])
+        # 真实存在的曲目仍能接受合法编辑。
+        status, body = self.patch(
+            self.existing["id"], {"title": "夜航（修订）"}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航（修订）")
+        self.assertEqual(body["description"], "说明\n\n第二段")
+        self.assertEqual(body["tags"], ["民谣"])
 
 
 if __name__ == "__main__":
