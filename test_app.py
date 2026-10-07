@@ -246,6 +246,19 @@
   部分资料返回 200 与更新后的完整曲目，只改变明确提交的字段。上述失败后列表
   仍能正常读取，已有曲目仍能接受合法编辑。
 
+首页关键词查找（GET / 的 q 参数）：
+- 名称、来源、说明或任一标签的完整文字包含关键词（连续文字，中文按原文、
+  英文字母不区分大小写）即显示该曲目；不跨字段或跨标签拼接凑命中，封面
+  地址与时长不参加搜索，百分号、下划线、引号、尖括号按普通文字查找并安全
+  显示。关键词去掉首尾空白后使用并保留在查找框中，内部空格仍是搜索内容；
+  留空或只含空白等同于不筛选。结果按标识升序，显示找到数量与曲库总数，
+  沿用列表的资料展示与编辑入口；同名记录与同一来源的多个版本各自独立
+  显示。只有名称的旧记录可按名称找到，缺失来源、空说明、空标签与页面
+  占位提示都不产生命中。没有匹配结果时说明没有符合关键词的曲目并保留
+  条件、提供清除入口；曲库为空时仍说明尚未收录曲目。重新打开带 q 的
+  地址看到同样条件下的当前结果；搜索不改写任何曲目，曲目列表接口始终
+  返回全部记录。
+
 运行：python3 -m unittest test_app -v
 """
 import html
@@ -10118,6 +10131,338 @@ class PreexistingLegacyBlankTitleFailureTest(_PreexistingLegacyLibraryFixture):
             self.assertEqual(
                 self.track_by_id(other_id), self.expected_legacy(other_id)
             )
+
+
+# ---------------------------------------------------------------------------
+# 首页关键词查找（GET / 的 q 参数）：在名称、来源、说明与每个标签的完整
+# 文字中查找连续文字，任意一项命中即显示；封面地址与时长不参加搜索。
+
+SEARCH_INPUT_RE = re.compile(
+    r'<input type="text" id="f-search" name="q"[^>]*?value="(.*?)"[^>]*?>',
+    re.DOTALL,
+)
+SEARCH_SUMMARY_RE = re.compile(
+    r'<p class="search-summary">(.*?)</p>', re.DOTALL
+)
+SEARCH_CLEAR_RE = re.compile(
+    r'<a class="search-clear" href="/">(.*?)</a>', re.DOTALL
+)
+
+
+def parse_search_box(page):
+    """提取首页关键词查找框中保留的关键词（已还原 HTML 转义）。"""
+    match = SEARCH_INPUT_RE.search(page)
+    assert match is not None, "页面中找不到关键词查找框"
+    return html.unescape(match.group(1))
+
+
+def parse_search_summary(page):
+    """提取搜索结果统计文字（找到的数量与曲库总数）。"""
+    match = SEARCH_SUMMARY_RE.search(page)
+    assert match is not None, "页面中没有搜索结果统计"
+    return strip_tags(match.group(1))
+
+
+def parse_clear_search_link(page):
+    """提取“清除搜索”链接文字；没有清除入口时返回 None。"""
+    match = SEARCH_CLEAR_RE.search(page)
+    return strip_tags(match.group(1)) if match is not None else None
+
+
+class HomeSearchTestCase(ServerTestCase):
+    """关键词查找用例的公共工具：按关键词打开首页并读取列表。"""
+
+    def home_page(self, keyword=None):
+        query = "" if keyword is None else "?" + urlencode({"q": keyword})
+        status, _, page = self.server.get_page(f"/{query}")
+        assert status == 200, f"打开首页失败：{status}"
+        return page
+
+    def listed_ids(self, page):
+        return [track_id for track_id, _ in parse_listed_tracks(page)]
+
+
+class HomeSearchFieldMatchTest(HomeSearchTestCase):
+    """名称、来源、说明或任一标签的完整文字包含关键词即显示该曲目。"""
+
+    def setUp(self):
+        super().setUp()
+        self.by_title = self.create_track(
+            title="夜航（现场版）",
+            source="/music/yehang-live.flac",
+            description="录音室版本",
+            tags=["民谣"],
+        )
+        self.by_source = self.create_track(
+            title="海港",
+            source="/music/现场录音/haigang.flac",
+            tags=["摇滚"],
+        )
+        self.by_description = self.create_track(
+            title="远山",
+            source="/music/yuanshan.flac",
+            description="这是一段现场采样的素材",
+        )
+        self.by_tag = self.create_track(
+            title="星图",
+            source="/music/xingtu.flac",
+            tags=["纯音乐", "现场版精选"],
+        )
+        self.unrelated = self.create_track(
+            title="晨跑",
+            source="/music/chenpao.flac",
+            description="节奏轻快",
+            tags=["运动"],
+        )
+
+    def test_keyword_matches_any_single_field(self):
+        page = self.home_page("现场")
+        ids = self.listed_ids(page)
+        # 名称、来源、说明、标签各自命中的四条都显示，未命中的不显示。
+        self.assertEqual(ids, [
+            self.by_title["id"],
+            self.by_source["id"],
+            self.by_description["id"],
+            self.by_tag["id"],
+        ])
+        # 结果按曲目标识升序，并显示找到的数量与曲库总数。
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(
+            parse_search_summary(page),
+            "找到 4 首符合关键词“现场”的曲目（曲库共 5 首）。",
+        )
+        # 查找框保留实际采用的关键词。
+        self.assertEqual(parse_search_box(page), "现场")
+
+    def test_results_keep_listing_display_and_edit_entry(self):
+        page = self.home_page("现场")
+        cards = parse_listed_track_cards(page)
+        # 命中的曲目沿用列表原有的资料展示。
+        self.assertEqual(
+            cards[self.by_title["id"]]["title"], "夜航（现场版）"
+        )
+        self.assertEqual(
+            cards[self.by_tag["id"]]["tags"], ["纯音乐", "现场版精选"]
+        )
+        kind, value = listed_field(cards, self.by_source["id"], "来源")
+        self.assertEqual((kind, value), ("text", "/music/现场录音/haigang.flac"))
+        # 每条结果仍提供编辑入口。
+        for track_id in self.listed_ids(page):
+            self.assertIn(f'href="/tracks/{track_id}/edit"', page)
+
+
+class HomeSearchMatchingRulesTest(HomeSearchTestCase):
+    """匹配规则：去首尾空白、英文不区分大小写、连续文字、特殊符号按
+    普通文字、不跨字段或跨标签拼接。"""
+
+    def test_english_letters_are_case_insensitive(self):
+        track = self.create_track(
+            title="夜航（Live版）", source="/music/live.flac"
+        )
+        for keyword in ("live", "LIVE", "Live"):
+            page = self.home_page(keyword)
+            self.assertEqual(self.listed_ids(page), [track["id"]])
+
+    def test_chinese_matches_literal_text(self):
+        track = self.create_track(title="夜航（现场版）", source="/music/a.flac")
+        page = self.home_page("现场")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+        # 连续文字而非整项相等：名称只是包含关键词，并不要求相等。
+        self.assertNotEqual(track["title"], "现场")
+
+    def test_keyword_trimmed_but_inner_space_is_content(self):
+        track = self.create_track(title="夜航 现场", source="/music/b.flac")
+        # 首尾空白被去掉后再查找，页面保留实际采用的关键词。
+        page = self.home_page("  夜航 现场  ")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+        self.assertEqual(parse_search_box(page), "夜航 现场")
+        # 内部空格是搜索内容：两个空格与名称中的一个空格不匹配。
+        page = self.home_page("夜航  现场")
+        self.assertIn("没有符合关键词", page)
+
+    def test_special_characters_are_plain_text(self):
+        track = self.create_track(
+            title="100%_纯净 \"'<引号>'", source="/music/c.flac"
+        )
+        other = self.create_track(title="普通曲目", source="/music/d.flac")
+        # 百分号与下划线不是通配符：只命中真正包含这段文字的曲目。
+        page = self.home_page("%_")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+        # 单独的 % 不能匹配所有曲目。
+        page = self.home_page("%")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+        # 引号与尖括号同样按普通文字查找。
+        page = self.home_page("\"'<引号>")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+        # 输入与结果中的文字按普通文字安全显示。
+        page = self.home_page("<script>")
+        self.assertIn('value="&lt;script&gt;"', page)
+        self.assertEqual(parse_search_box(page), "<script>")
+        self.assertEqual(
+            parse_search_summary(page),
+            "找到 0 首符合关键词“<script>”的曲目（曲库共 2 首）。",
+        )
+
+    def test_no_concatenation_across_tags_or_fields(self):
+        # 一个标签有“夜”、另一个标签有“航”，不能凑出“夜航”。
+        split_tags = self.create_track(
+            title="其他", source="/music/e.flac", tags=["夜", "航"]
+        )
+        # 名称有“夜”、说明有“航”，同样不能跨字段凑出命中。
+        split_fields = self.create_track(
+            title="夜", source="/music/f.flac", description="航"
+        )
+        page = self.home_page("夜航")
+        self.assertIn("没有符合关键词", page)
+        self.assertIsNone(TRACK_LIST_RE.search(page))
+        # 同一个标签完整包含关键词才命中。
+        page = self.home_page("夜")
+        self.assertEqual(
+            self.listed_ids(page), [split_tags["id"], split_fields["id"]]
+        )
+
+
+class HomeSearchScopeTest(HomeSearchTestCase):
+    """搜索范围：封面地址与时长不参加；旧记录按名称可找；占位提示不是
+    资料。"""
+
+    def test_cover_url_and_duration_are_not_searched(self):
+        self.create_track(
+            title="海港",
+            source="/music/haigang.flac",
+            cover_url="独特封面文字.jpg",
+            duration=243.5,
+        )
+        for keyword in ("独特封面", "243.5"):
+            page = self.home_page(keyword)
+            self.assertIn("没有符合关键词", page)
+
+    def test_legacy_record_searchable_by_title_only(self):
+        legacy_id = self.server.insert_legacy("旧歌名")
+        self.create_track(title="新曲", source="/music/new.flac")
+        # 只有名称的旧记录可按名称找到。
+        page = self.home_page("旧歌")
+        self.assertEqual(self.listed_ids(page), [legacy_id])
+        # 旧记录缺失的来源、说明与标签视为没有可匹配的文字。
+        page = self.home_page("未填写")
+        self.assertIn("没有符合关键词", page)
+        page = self.home_page("无")
+        self.assertIn("没有符合关键词", page)
+
+    def test_empty_fields_provide_no_matchable_text(self):
+        track = self.create_track(
+            title="空白资料", source="/music/blank.flac",
+            description="", tags=[],
+        )
+        # 空说明与空标签不产生命中；页面占位文字不被当作资料。
+        for keyword in ("未填写", "无", "未知"):
+            page = self.home_page(keyword)
+            self.assertIn("没有符合关键词", page)
+        # 名称本身仍正常命中。
+        page = self.home_page("空白")
+        self.assertEqual(self.listed_ids(page), [track["id"]])
+
+
+class HomeSearchEmptyStatesTest(HomeSearchTestCase):
+    """无结果、空曲库、留空关键词与清除搜索的页面表现。"""
+
+    def test_no_match_keeps_keyword_and_offers_clear(self):
+        self.create_track(title="夜航", source="/music/yh.flac")
+        page = self.home_page("不存在的关键词")
+        self.assertIn("没有符合关键词", page)
+        # 搜索条件保留在查找框中，并提供清除搜索入口。
+        self.assertEqual(parse_search_box(page), "不存在的关键词")
+        self.assertIsNotNone(parse_clear_search_link(page))
+        self.assertEqual(
+            parse_search_summary(page),
+            "找到 0 首符合关键词“不存在的关键词”的曲目（曲库共 1 首）。",
+        )
+
+    def test_empty_library_still_reports_no_tracks(self):
+        page = self.home_page("任意")
+        self.assertIn("还没有曲目记录", page)
+
+    def test_blank_keyword_means_no_filter(self):
+        first = self.create_track(title="甲", source="/music/1.flac")
+        second = self.create_track(title="乙", source="/music/2.flac")
+        for keyword in ("", "   ", "　"):
+            page = self.home_page(keyword)
+            # 留空或只含空白等同于不筛选：完整列表与原有顺序，无搜索统计。
+            self.assertEqual(
+                self.listed_ids(page), [first["id"], second["id"]]
+            )
+            self.assertIsNone(SEARCH_SUMMARY_RE.search(page))
+            self.assertIsNone(parse_clear_search_link(page))
+
+    def test_clear_search_restores_full_list(self):
+        first = self.create_track(title="夜航", source="/music/3.flac")
+        second = self.create_track(title="海港", source="/music/4.flac")
+        page = self.home_page("夜航")
+        self.assertEqual(self.listed_ids(page), [first["id"]])
+        # 清除搜索（回到不带条件的地址）后恢复完整列表与原有顺序。
+        page = self.home_page()
+        self.assertEqual(
+            self.listed_ids(page), [first["id"], second["id"]]
+        )
+        self.assertIsNone(SEARCH_SUMMARY_RE.search(page))
+        # 首页始终提供关键词查找框。
+        self.assertEqual(parse_search_box(page), "")
+
+
+class HomeSearchSideEffectsTest(HomeSearchTestCase):
+    """搜索只改变首页展示：不改写曲目，列表接口仍返回全部记录；同名
+    记录与同一来源的多个版本各自独立参加搜索。"""
+
+    def test_search_does_not_change_data_and_api_returns_all(self):
+        first = self.create_track(
+            title="夜航", source="/music/5.flac", tags=["民谣"]
+        )
+        second = self.create_track(title="海港", source="/music/6.flac")
+        before = self.server.list_tracks()
+        self.home_page("夜航")
+        # 搜索不新增、不改写任何曲目。
+        self.assertEqual(self.server.list_tracks(), before)
+        # 曲目列表接口保持返回全部记录。
+        self.assertEqual(
+            [track["id"] for track in self.server.list_tracks()],
+            [first["id"], second["id"]],
+        )
+
+    def test_reopening_search_url_shows_current_results(self):
+        first = self.create_track(title="夜航", source="/music/7.flac")
+        page = self.home_page("航")
+        self.assertEqual(self.listed_ids(page), [first["id"]])
+        # 重新打开同一搜索结果地址，看到同样条件下的当前结果。
+        second = self.create_track(title="航标", source="/music/8.flac")
+        page = self.home_page("航")
+        self.assertEqual(
+            self.listed_ids(page), [first["id"], second["id"]]
+        )
+        self.assertEqual(
+            parse_search_summary(page),
+            "找到 2 首符合关键词“航”的曲目（曲库共 2 首）。",
+        )
+
+    def test_same_title_and_versions_are_listed_independently(self):
+        first = self.create_track(title="夜航", source="/music/9.flac")
+        # 名称相同的记录独立参加搜索。
+        second = self.create_track(title="夜航", source="/music/10.flac")
+        # 同一来源另存的多个版本也各自独立显示。
+        status, third = self.server.request("POST", "/api/tracks", {
+            "title": "夜航",
+            "source": "/music/9.flac",
+            "save_as_new_version": True,
+        })
+        assert status == 201, f"准备数据失败：{status} {third}"
+        page = self.home_page("夜航")
+        self.assertEqual(
+            self.listed_ids(page),
+            [first["id"], second["id"], third["id"]],
+        )
+        self.assertEqual(
+            parse_search_summary(page),
+            "找到 3 首符合关键词“夜航”的曲目（曲库共 3 首）。",
+        )
 
 
 if __name__ == "__main__":
