@@ -231,6 +231,26 @@
   部分资料返回 200 与更新后的完整曲目，只改变明确提交的字段。上述失败后列表
   仍能正常读取，已有曲目仍能接受合法编辑。
 
+启动前旧曲库（曲库文件在服务进程启动前就已存在，整张表只有标识与名称
+两列，由服务启动时补齐新资料列——既有旧记录用例都是启动后再写入缺少
+资料的记录，这里固定的是“用户把旧曲库直接交给当前服务打开”的行为）：
+- 曲目列表接口与首页都直接提供原有记录，标识、名称与记录数量不变，
+  列表按标识升序；标识可以不从 1 开始、中间允许空缺，不重新编号也不
+  补出不存在的曲目；名称相同的两条记录各自保留；中文名称中的内部空格、
+  连续空行、引号与尖括号不被裁剪、合并或改写，首页按原有分行显示名称，
+  形似网页标签的文字按普通文字转义显示。
+- 缺少的新资料按旧记录规则读取与展示：接口中来源、时长为 null，封面
+  地址与说明为空字符串，标签为空数组；首页把来源、时长、封面地址与
+  说明显示为未填写，标签显示为无；未知时长不被当成零秒，缺失来源也
+  不凭名称或标识自动生成。
+- 进入一条旧曲目的编辑页看到原名称与对应的空资料；来源保留空白、只
+  补合法时长与说明后保存，继续使用原标识，列表接口与重新打开的编辑
+  页都读到已保存内容，其他旧记录不受影响。同一次编辑中名称变成纯
+  空白时返回 400 并指出名称有误，原曲目的名称、缺失来源及其他资料
+  保持原样，本次填写的时长与说明留在错误页中；只修正名称后再保存
+  采用错误页里的填写，不新增曲目。正常曲库的收录、编辑与来源冲突
+  规则继续保持兼容。
+
 运行：python3 -m unittest test_app -v
 """
 import html
@@ -425,13 +445,55 @@ def parse_listed_durations(page):
             for match in TRACK_DURATION_LINE_RE.finditer(listing.group(1))]
 
 
+TRACK_BLOCK_RE = re.compile(r'<li id="track-(\d+)"[^>]*>(.*?)</li>', re.DOTALL)
+
+
+def parse_track_blocks(page):
+    """提取首页列表中每条曲目整块标记，返回 {id: block}，用于逐条核对
+    名称分行/转义与各资料行的占位显示。"""
+    listing = TRACK_LIST_RE.search(page)
+    assert listing is not None, "页面中没有曲目列表"
+    return {
+        int(match.group(1)): match.group(2)
+        for match in TRACK_BLOCK_RE.finditer(listing.group(1))
+    }
+
+
+def write_legacy_database(path, records):
+    """在服务启动前按旧版结构写好曲库：整张表只有标识与名称两列。
+
+    records 为 (id, title) 序列，标识按原值写入（可不从 1 开始、中间允许
+    空缺，也允许名称重复）；不创建来源、时长、封面地址、说明、标签等新
+    资料列，模拟用户把只有旧记录的曲库直接交给当前服务打开——迁移补齐
+    列与旧记录兼容行为都必须发生在服务启动时。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(path)
+    try:
+        database.execute(
+            "CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT NOT NULL)"
+        )
+        database.executemany(
+            "INSERT INTO tracks (id, title) VALUES (?, ?)", list(records)
+        )
+        database.commit()
+    finally:
+        database.close()
+
 
 class Server:
-    """在临时数据目录上启动一个真实服务进程，测试结束后关闭。"""
+    """在临时数据目录上启动一个真实服务进程，测试结束后关闭。
 
-    def __init__(self):
+    prepare 回调（若提供）在服务进程启动前运行，接收临时数据目录：
+    用于把曲库按旧版结构提前写好，覆盖“曲库在启动前就已存在”的场景。
+    """
+
+    def __init__(self, prepare=None):
         self._tmp = tempfile.TemporaryDirectory()
         self.data_dir = Path(self._tmp.name)
+        if prepare is not None:
+            prepare(self.data_dir)
         self.proc = subprocess.Popen(
             [
                 sys.executable, str(APP), "serve",
@@ -565,7 +627,9 @@ class Server:
 
 class ServerTestCase(unittest.TestCase):
     def setUp(self):
-        self.server = Server()
+        # 子类可用 prepare(data_dir) 类属性在服务启动前预置曲库文件。
+        prepare = getattr(self, "prepare", None)
+        self.server = Server(prepare=prepare)
         self.addCleanup(self.server.close)
 
     def create_track(self, **fields):
@@ -5359,6 +5423,312 @@ class LegacyTrackCreateTest(ServerTestCase):
         existing_ids = {item["id"] for item in body["existing"]}
         self.assertNotIn(self.legacy_a, existing_ids)
         self.assertNotIn(self.legacy_b, existing_ids)
+
+
+# 启动前旧曲库用例中一条集中了特殊文字的名称：内部双空格、连续空行、
+# 中英文引号与尖括号、形似网页标签的内容，打开曲库时都必须原样保留。
+SPECIAL_PREEXISTING_LEGACY_TITLE = (
+    '同名另版："双引号" 与 “中文引号”\n'
+    '\n'
+    '内部  双空格 与 <b>不是加粗</b>\n'
+    '\n'
+    '\n'
+    '<script>alert(1)</script> 与 <看起来像标签>'
+)
+
+
+class PreexistingLegacyLibraryTest(ServerTestCase):
+    """曲库在服务启动前就已存在、且仍是只有标识与名称的旧版结构。
+
+    既有的旧记录用例都是在服务启动之后再写入缺少资料的记录；这里把曲库
+    按旧版表结构（整张表只有 id、title 两列）在服务进程启动前写好，由
+    服务启动时补齐新列并直接打开：原有标识与名称必须原样可读，缺少的
+    来源、时长、封面地址、说明与标签按旧记录规则展示并能继续整理。
+    """
+
+    # 标识不从 1 开始（最小为 7），中间留有空缺（8、10-12、14-20 不存在），
+    # 且 7 与 9 名称完全相同；13 的名称集中了内部空格、连续空行、引号与
+    # 尖括号等必须原样保留的内容。
+    LEGACY_RECORDS = [
+        (7, "同名曲"),
+        (9, "同名曲"),
+        (13, SPECIAL_PREEXISTING_LEGACY_TITLE),
+        (21, "江畔小调"),
+    ]
+    LEGACY_IDS = [7, 9, 13, 21]
+    FILLED_DESCRIPTION = "补写的说明：第一段\n\n第二行：含中文与空行"
+    FAILURE_DESCRIPTION = "本次填写的说明\n第二行：修正名称后应采用"
+
+    def prepare(self, data_dir):
+        # 服务启动前就把旧版曲库放到数据目录：迁移与兼容都发生在启动时。
+        write_legacy_database(
+            data_dir / "sound-shelf.sqlite", self.LEGACY_RECORDS
+        )
+
+    def tracks_by_id(self):
+        return {track["id"]: track for track in self.list_tracks()}
+
+    def assert_legacy_shape(self, record, *, title):
+        """旧记录在接口中的固定形态：来源/时长为 null，其余为空资料。"""
+        self.assertEqual(record["title"], title)
+        # 缺失来源不能凭名称或标识自动生成；未知时长不能被当成零秒。
+        self.assertIsNone(record["source"], "缺失来源不能被自动生成")
+        self.assertIsNone(record["duration"], "未知时长不能被当成零秒")
+        self.assertEqual(record["cover_url"], "")
+        self.assertEqual(record["description"], "")
+        self.assertEqual(record["tags"], [])
+
+    def test_api_serves_original_records_unchanged_in_id_order(self):
+        tracks = self.list_tracks()
+        # 记录数量保持不变；标识既不重新编号，也不补出空缺的曲目，
+        # 列表仍按标识升序排列。
+        self.assertEqual(len(tracks), 4)
+        self.assertEqual([track["id"] for track in tracks], self.LEGACY_IDS)
+        for record, (record_id, title) in zip(tracks, self.LEGACY_RECORDS):
+            self.assertEqual(record["id"], record_id)
+            self.assert_legacy_shape(record, title=title)
+        # 名称相同的两条记录仍各自保留。
+        self.assertEqual(self.tracks_by_id()[7]["title"], "同名曲")
+        self.assertEqual(self.tracks_by_id()[9]["title"], "同名曲")
+
+    def test_home_lists_original_records_with_legacy_placeholders(self):
+        page = self.get_home()
+        # 首页同样提供原有记录，名称、数量与标识升序次序不变。
+        self.assertEqual(
+            parse_listed_tracks(page),
+            [(record_id, title) for record_id, title in self.LEGACY_RECORDS],
+        )
+        # 旧记录的未知时长在首页显示“未填写”，而不是“0 秒”或“未知”。
+        self.assertEqual(parse_listed_durations(page), ["未填写"] * 4)
+        blocks = parse_track_blocks(page)
+        self.assertEqual(sorted(blocks), self.LEGACY_IDS)
+        for block in blocks.values():
+            # 来源、时长、封面、说明未填写，标签为无。
+            self.assertIn(
+                '<dt>来源</dt><dd><span class="unfilled">未填写</span></dd>',
+                block,
+            )
+            self.assertIn(
+                '<dt>时长</dt><dd><span class="unfilled">未填写</span></dd>',
+                block,
+            )
+            self.assertIn(
+                '<dt>封面地址</dt><dd>'
+                '<span class="unfilled">未填写</span></dd>',
+                block,
+            )
+            self.assertIn(
+                '<dt>标签</dt><dd><span class="unfilled">无</span></dd>',
+                block,
+            )
+            self.assertIn(
+                '<dt>说明</dt><dd class="notes">'
+                '<span class="unfilled">未填写</span></dd>',
+                block,
+            )
+
+    def test_home_keeps_title_lines_and_shows_tag_looking_text_as_plain(self):
+        page = self.get_home()
+        block = parse_track_blocks(page)[13]
+        title_match = re.search(
+            r'<p class="track-title">(.*?)</p>', block, re.DOTALL
+        )
+        self.assertIsNotNone(title_match)
+        title_markup = title_match.group(1)
+        # 名称按原有分行完整显示：内部双空格与连续空行都在原位。
+        self.assertIn(
+            html.escape(SPECIAL_PREEXISTING_LEGACY_TITLE, quote=True),
+            title_markup,
+        )
+        self.assertIn("内部  双空格", block)
+        # 引号、尖括号与形似网页标签的内容按普通文字转义，不生成页面元素。
+        self.assertIn("&lt;b&gt;不是加粗&lt;/b&gt;", block)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", block)
+        self.assertIn("&lt;看起来像标签&gt;", block)
+        self.assertNotIn("<b>不是加粗</b>", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+
+    def test_edit_page_opens_with_original_title_and_blank_metadata(self):
+        page = self.get_edit_page(9)
+        # 原名称在名称框中；来源缺失表现为空来源框（而不是生成的文字），
+        # 时长框为空，封面、说明为空，只有一个空标签框。
+        self.assert_form_values(
+            page, title="同名曲", source="", duration="",
+            cover_url="", description="",
+        )
+        self.assert_tag_boxes(page, [""])
+
+    def test_edit_page_opens_special_title_with_lines_and_escapes(self):
+        page = self.get_edit_page(13)
+        self.assertEqual(
+            parse_title_box(page), SPECIAL_PREEXISTING_LEGACY_TITLE
+        )
+        self.assert_form_values(
+            page, source="", duration="", cover_url="", description=""
+        )
+        self.assert_tag_boxes(page, [""])
+        title_markup = TITLE_RE.search(page).group(0)
+        self.assertIn("&lt;b&gt;不是加粗&lt;/b&gt;", title_markup)
+        self.assertIn("&lt;看起来像标签&gt;", title_markup)
+        self.assertNotIn("<b>不是加粗</b>", title_markup)
+
+    def test_edit_fills_duration_description_with_blank_source_keeps_id(self):
+        # 进入其中一条旧曲目的编辑页，保留来源空白，只补合法时长与说明。
+        page = self.get_edit_page(9)
+        fields = self.edit_fields_from_rendered_page(page)
+        fields = self.form_with_field(fields, "duration", "243.5")
+        fields = self.form_with_field(
+            fields, "description", self.FILLED_DESCRIPTION.replace("\n", "\r\n")
+        )
+        location, listing_page = self.submit_edit_form_and_open_listing(9, fields)
+        self.assertEqual(location, "/?highlight=9&edited=1")
+
+        # 继续使用原标识；来源仍为 null，只写入本次填写的时长与说明。
+        self.assertEqual(self.track_by_id(9), {
+            "id": 9,
+            "title": "同名曲",
+            "source": None,
+            "duration": 243.5,
+            "cover_url": "",
+            "description": self.FILLED_DESCRIPTION,
+            "tags": [],
+        })
+        # 不新增曲目、不重新编号，列表仍按标识升序。
+        self.assertEqual(
+            [track["id"] for track in self.list_tracks()], self.LEGACY_IDS
+        )
+        # 回到首页：这一条显示已知时长，缺失来源仍显示未填写。
+        self.assertEqual(
+            parse_listed_durations(listing_page),
+            ["未填写", "243.5 秒", "未填写", "未填写"],
+        )
+        edited_block = parse_track_blocks(listing_page)[9]
+        self.assertIn(
+            '<dt>来源</dt><dd><span class="unfilled">未填写</span></dd>',
+            edited_block,
+        )
+        self.assertIn("<dt>时长</dt><dd>243.5 秒</dd>", edited_block)
+        self.assertIn("补写的说明：第一段", edited_block)
+
+        # 重新打开的编辑页读到已保存内容，来源仍为空。
+        reopened = self.get_edit_page(9)
+        self.assert_form_values(
+            reopened, title="同名曲", source="", duration="243.5",
+            cover_url="", description=self.FILLED_DESCRIPTION,
+        )
+        self.assert_tag_boxes(reopened, [""])
+
+        # 同名的另一条旧记录与其余旧记录完全不受影响。
+        tracks = self.tracks_by_id()
+        self.assert_legacy_shape(tracks[7], title="同名曲")
+        self.assert_legacy_shape(
+            tracks[13], title=SPECIAL_PREEXISTING_LEGACY_TITLE
+        )
+        self.assert_legacy_shape(tracks[21], title="江畔小调")
+
+    def test_blank_title_edit_returns_400_keeps_record_and_reprints_entries(self):
+        # 同一次编辑中名称变成纯空白，同时填写合法时长与说明。
+        fields = self.edit_form_fields(
+            title="  \r\n \t ",
+            source="",
+            duration="188",
+            description=self.FAILURE_DESCRIPTION.replace("\n", "\r\n"),
+        )
+        status, _, page = self.post_edit_form(7, fields)
+        self.assertEqual(status, 400)
+        # 页面返回 400 并指出名称有误：横幅与名称框旁都有对应提示，
+        # 不出现修改成功。
+        banner = BANNER_ERROR_RE.search(page)
+        self.assertIsNotNone(banner, "页面上应显示保存失败提示")
+        self.assertIn("名称", strip_tags(banner.group(1)))
+        field_errors = [strip_tags(raw) for raw in FIELD_ERROR_RE.findall(page)]
+        self.assertTrue(
+            any("名称" in text for text in field_errors),
+            f"名称字段旁应显示错误，实际：{field_errors}",
+        )
+        self.assertIsNone(BANNER_SUCCESS_RE.search(page))
+
+        # 原曲目保持原样：名称仍是原名，来源仍缺失，本次时长没有被当成
+        # 0 秒写入，记录数量、标识与升序次序都不变。
+        self.assertEqual(
+            [track["id"] for track in self.list_tracks()], self.LEGACY_IDS
+        )
+        tracks = self.tracks_by_id()
+        self.assert_legacy_shape(tracks[7], title="同名曲")
+        self.assert_legacy_shape(tracks[9], title="同名曲")
+        self.assert_legacy_shape(
+            tracks[13], title=SPECIAL_PREEXISTING_LEGACY_TITLE
+        )
+        self.assert_legacy_shape(tracks[21], title="江畔小调")
+        # 错误页附带的曲目列表里该曲目仍显示原名称。
+        self.assertEqual(
+            parse_listed_tracks(page),
+            [(record_id, title) for record_id, title in self.LEGACY_RECORDS],
+        )
+
+        # 本次填写的名称空白、时长与说明留在错误页中，来源与封面仍为空。
+        self.assertEqual(parse_title_box(page), "  \n \t ")
+        self.assert_form_values(page, source="", duration="188", cover_url="")
+        self.assertEqual(parse_description_box(page), self.FAILURE_DESCRIPTION)
+
+    def test_fix_only_title_after_failure_uses_reprinted_fillings(self):
+        # 第一次保存：名称改成纯空白，合法时长与说明随表提交，被 400 拒绝。
+        fields = self.edit_form_fields(
+            title="   \r\n",
+            source="",
+            duration="188",
+            description=self.FAILURE_DESCRIPTION.replace("\n", "\r\n"),
+        )
+        status, _, failed_page = self.post_edit_form(7, fields)
+        self.assertEqual(status, 400)
+        self.assert_legacy_shape(self.tracks_by_id()[7], title="同名曲")
+
+        # 只修正名称，错误页里的其余填写原样再次提交。
+        retry_fields = self.edit_fields_from_rendered_page(failed_page)
+        retry_fields = self.form_with_field(
+            retry_fields, "title", "同名曲（现场整理）"
+        )
+        retry_fields = [
+            (name, value.replace("\n", "\r\n"))
+            if name in ("description", "tags") else (name, value)
+            for name, value in retry_fields
+        ]
+        location, listing_page = self.submit_edit_form_and_open_listing(
+            7, retry_fields
+        )
+        self.assertEqual(location, "/?highlight=7&edited=1")
+
+        # 采用错误页里填写的时长与说明，继续使用原标识，来源仍缺失。
+        self.assertEqual(self.track_by_id(7), {
+            "id": 7,
+            "title": "同名曲（现场整理）",
+            "source": None,
+            "duration": 188,
+            "cover_url": "",
+            "description": self.FAILURE_DESCRIPTION,
+            "tags": [],
+        })
+        # 不新增曲目：仍是四条记录，标识与升序次序不变。
+        self.assertEqual(
+            [track["id"] for track in self.list_tracks()], self.LEGACY_IDS
+        )
+        # 重新打开的编辑页读到的名称、时长与说明就是这两次表单的结果。
+        reopened = self.get_edit_page(7)
+        self.assert_form_values(
+            reopened,
+            title="同名曲（现场整理）",
+            source="",
+            duration="188",
+            cover_url="",
+            description=self.FAILURE_DESCRIPTION,
+        )
+        # 同名的另一条旧记录与其余旧记录保持原样。
+        tracks = self.tracks_by_id()
+        self.assert_legacy_shape(tracks[9], title="同名曲")
+        self.assert_legacy_shape(
+            tracks[13], title=SPECIAL_PREEXISTING_LEGACY_TITLE
+        )
+        self.assert_legacy_shape(tracks[21], title="江畔小调")
 
 
 class SaveAsNewVersionTypeValidationTest(ServerTestCase):
