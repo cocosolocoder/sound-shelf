@@ -26,6 +26,20 @@ FIELD_LABELS = {
 
 TRACK_COLUMNS = "id, title, source, duration, cover_url, description, tags"
 
+# read_json_body 的哨兵返回值：请求体不是有效 JSON 时已响应 400，
+# 调用方据此直接结束处理。用独立哨兵而不是 None，因为 "null" 是
+# 可解析的 JSON 请求体，要走后续的“必须是 JSON 对象”校验。
+INVALID_JSON_BODY = object()
+
+# 来源冲突的提示：收录与编辑的措辞不同，各自保留。
+CREATE_CONFLICT_MESSAGE = (
+    "该来源已存在曲目记录；如确需另存为新版本，"
+    "请将 save_as_new_version 设为 true 后重试"
+)
+EDIT_CONFLICT_MESSAGE = (
+    "该来源已被其他曲目使用；请修改来源后重试，或取消编辑后另存新版本"
+)
+
 
 class PayloadError(Exception):
     """字段校验失败，field 为出错字段名。"""
@@ -949,6 +963,38 @@ def main():
                 length = 0
             return self.rfile.read(max(length, 0))
 
+        # ------------------------------------------------------------------
+        # JSON 接口（收录与编辑）共用的请求解析与错误响应。
+
+        def read_json_body(self):
+            """读取并解析 JSON 请求体。
+
+            成功时返回解析结果；空体、无法解析的 JSON 或不能按 UTF-8
+            解码的内容响应 400（只说明请求体不是有效 JSON，不带 field）
+            并返回 INVALID_JSON_BODY 哨兵，调用方应直接结束处理。
+            """
+            raw = self.read_body()
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.respond(400, {"error": "请求体不是有效的 JSON"})
+                return INVALID_JSON_BODY
+
+        def respond_field_error(self, exc):
+            """字段校验失败：400，field 指出实际出错字段（整体类型错误
+            时为 null），保留校验器给出的错误文字。"""
+            label = FIELD_LABELS.get(exc.field)
+            message = f"{label}有误：{exc.message}" if label else exc.message
+            self.respond(400, {"error": message, "field": exc.field})
+
+        def respond_source_conflict(self, message, conflicts):
+            """来源冲突：409，existing 按标识升序列出已有记录的标识与
+            名称；收录与编辑各自的提示文字由调用方给出。"""
+            self.respond(
+                409,
+                {"error": message, "field": "source", "existing": conflicts},
+            )
+
         def error_page(self, status, message, form, *, field=None, conflicts=None,
                        edit_track=None):
             page = render_page(
@@ -1014,28 +1060,16 @@ def main():
             self.respond(200, {RESOURCE: list_tracks(database)})
 
         def handle_api_post(self):
-            raw = self.read_body()
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.respond(400, {"error": "请求体不是有效的 JSON"})
+            data = self.read_json_body()
+            if data is INVALID_JSON_BODY:
                 return
             try:
                 record, conflicts = create_track(database, data)
             except PayloadError as exc:
-                label = FIELD_LABELS.get(exc.field)
-                message = f"{label}有误：{exc.message}" if label else exc.message
-                self.respond(400, {"error": message, "field": exc.field})
+                self.respond_field_error(exc)
                 return
             if conflicts is not None:
-                self.respond(
-                    409,
-                    {
-                        "error": "该来源已存在曲目记录；如确需另存为新版本，请将 save_as_new_version 设为 true 后重试",
-                        "field": "source",
-                        "existing": conflicts,
-                    },
-                )
+                self.respond_source_conflict(CREATE_CONFLICT_MESSAGE, conflicts)
                 return
             self.respond(201, record)
 
@@ -1127,31 +1161,21 @@ def main():
             )
 
         def handle_api_patch(self, track_id):
-            raw = self.read_body()
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.respond(400, {"error": "请求体不是有效的 JSON"})
+            # 先解析请求体：无法解析的内容无论曲目是否存在都报格式错误；
+            # 能解析时才判断曲目是否存在（404 优先于字段与类型校验）。
+            data = self.read_json_body()
+            if data is INVALID_JSON_BODY:
                 return
             try:
                 record, conflicts = update_track(database, track_id, data)
             except PayloadError as exc:
-                label = FIELD_LABELS.get(exc.field)
-                message = f"{label}有误：{exc.message}" if label else exc.message
-                self.respond(400, {"error": message, "field": exc.field})
+                self.respond_field_error(exc)
                 return
             if record is None:
                 if conflicts == "not_found":
                     self.respond(404, {"error": f"曲目 #{track_id} 不存在"})
                 else:
-                    self.respond(
-                        409,
-                        {
-                            "error": "该来源已被其他曲目使用；请修改来源后重试，或取消编辑后另存新版本",
-                            "field": "source",
-                            "existing": conflicts,
-                        },
-                    )
+                    self.respond_source_conflict(EDIT_CONFLICT_MESSAGE, conflicts)
                 return
             self.respond(200, record)
 
