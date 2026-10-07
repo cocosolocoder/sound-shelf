@@ -70,6 +70,22 @@
   实际占用该来源的记录；冲突后任何记录都不被改动，可换来源直接重试。
 - 只有标识与名称、来源缺失的旧记录：省略来源可正常编辑且不参与判重；
   补填已被占用的来源同样适用拒绝保存规则。
+- 请求体格式与整份资料类型（PATCH body）：目标曲目存在时，空请求体、
+  缺少结尾的 JSON、JSON 前后夹有多余文字或纯文字、以及不能按 UTF-8
+  解码的请求内容都返回 400 和可读的完整 JSON 错误“请求体不是有效的
+  JSON”（无 field），不出现连接突然断开或保存成功；能解析成 JSON 但
+  顶层是数组、字符串、数字、布尔值或 null（含顶层 NaN/Infinity）时
+  同样返回 400，错误说明“请求体必须是 JSON 对象”且 field 为 null，
+  不把问题归给名称、时长等某个字段，也不保存其中内容。两类失败后列表
+  中目标曲目、同一来源的多个独立版本与其他曲目的标识、完整资料（含
+  说明的中文与空行、标签的完整文字与先后）、数量与次序都与提交前一致；
+  被拒绝的内容不会在后续合法请求中自动补入，实际保存只采用后一次请求
+  明确提交的资料。不存在的普通数字标识：无法解析的请求体先返回 400 的
+  JSON 格式错误；请求体能解析时即使顶层不是对象或带非法字段，也返回
+  404 说明曲目不存在，不继续报告字段错误。对照：提交部分资料返回 200
+  与更新后的完整曲目，只改变明确提交的字段；空对象 {} 同样返回 200 且
+  原记录完整保留——空请求体（400）与空对象（200）必须有各自明确的结果；
+  上述失败之后列表仍能正常读取，已有曲目仍能接受合法编辑。
 - 时长（PATCH duration）：改成 0 或有限的非负小数时，成功响应中的时长
   与之后读取曲目列表得到的值一致，不做换算、舍入或自动纠错；只有明确
   提交 null 才把时长改成未知，0 仍然是已知的数字时长；只改名称或说明、
@@ -549,6 +565,43 @@ class ServerTestCase(unittest.TestCase):
             "PATCH", f"/api/tracks/{track_id}", raw_text
         )
         return status, json.loads(raw) if raw else None
+
+    def patch_bytes(self, track_id, body):
+        """发送任意字节的 PATCH 请求体，返回 (status, headers, body_bytes)。
+
+        body=None 表示完全不发送请求体（连 Content-Length 也没有）；
+        用于空请求体、非法 UTF-8 字节等无法构造成 JSON 值的场景。
+        """
+        return self.server.raw_request(
+            "PATCH", f"/api/tracks/{track_id}", body,
+            content_type="application/json",
+        )
+
+    def assert_json_format_error(self, status, headers, raw):
+        """断言返回了完整、可读的 400 JSON 错误：请求体不是有效的 JSON。
+
+        格式错误不是资料字段错误：响应中不应出现 field，错误文字也不归咎
+        于名称、时长等任一资料字段；Content-Length 与响应体一致说明服务端
+        写完了完整响应，而不是突然断开连接。
+        """
+        self.assertEqual(status, 400, raw)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body, {"error": "请求体不是有效的 JSON"})
+
+    def assert_json_object_required_error(self, status, headers, raw):
+        """断言返回了完整、可读的 400 JSON 错误：资料必须是 JSON 对象。
+
+        field 为 JSON null，且错误文字不把问题归给任一资料字段。
+        """
+        self.assertEqual(status, 400, raw)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body, {"error": "请求体必须是 JSON 对象", "field": None})
+        for label in ("名称", "来源", "时长", "封面", "说明", "标签"):
+            self.assertNotIn(label, body["error"])
 
     def post_raw(self, raw_text):
         """发送原始 JSON 文本的 POST（用于 NaN/Infinity 等非标准片段）。
@@ -8635,6 +8688,432 @@ class EditCoverApiInvalidTypeTest(ServerTestCase):
             self.track_by_id(self.track_id)["cover_url"],
             "https://img.example/yehang.png",
         )
+
+
+class EditMalformedJsonBodyTest(ServerTestCase):
+    """PATCH 请求体无法解析成 JSON：400 JSON 格式错误，整条资料原样保留。
+
+    与资料字段类型错误不同：空请求体、缺少结尾的 JSON、夹有多余文字的
+    JSON 与不能按 UTF-8 解码的字节都属于“请求体不是有效的 JSON”，
+    调用者应能凭错误文字和缺失的 field 把它与资料错误区分开。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 目标曲目与同一来源的另一独立版本：资料里含中文、首尾空格、
+        # 连续空行与多个标签，失败后这些资料都必须逐字保留。
+        self.target = self.create_track(
+            title="夜航（首版）",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="开头说明\n\n第二段：保留中文与空行  \n\n",
+            tags=["民谣", "现场版", "民谣（不插电）"],
+        )
+        self.target_id = self.target["id"]
+        self.version = self.create_track(
+            title="夜航（重制版）",
+            source="/music/yehang.flac",
+            duration=250,
+            cover_url="https://img.example/remaster.png",
+            description="重制说明\n第二行",
+            tags=["重制", "现场版"],
+            save_as_new_version=True,
+        )
+        self.other = self.create_track(
+            title="无关曲目",
+            source="/music/other.flac",
+            duration=9,
+            description="别的来源\n\n空行之后",
+            tags=["其他来源"],
+        )
+
+    def malformed_bodies(self):
+        """各种无法解析为 JSON 的请求体，片段中夹带的都是不该保存的修改。"""
+        return [
+            ("空请求体（不带 Content-Length）", None),
+            ("空请求体（Content-Length 为 0）", b""),
+            ("只有空白", b"   \n\t  "),
+            (
+                "对象缺少结尾",
+                '{"title": "不应保存的名称", "duration": 12'.encode("utf-8"),
+            ),
+            ("数组缺少结尾", '{"tags": ["一", "二"]'.encode("utf-8")),
+            ("字符串值没有写完", '{"description": "截断的说明'.encode("utf-8")),
+            ("数字没有写完", b'{"duration": 243.'),
+            (
+                "JSON 后夹有多余文字",
+                '{"title": "不应保存的名称"}后面多余文字'.encode("utf-8"),
+            ),
+            (
+                "JSON 前夹有多余文字",
+                '前面多余文字{"title": "不应保存的名称"}'.encode("utf-8"),
+            ),
+            ("纯文字不是 JSON", "这不是一段 JSON".encode("utf-8")),
+            # 不能按 UTF-8 解码的请求内容：UTF-8 解码失败与 JSON 语法错误
+            # 同样按无效请求体处理。
+            ("含非法 UTF-8 字节", '{"title": "坏字节'.encode("utf-8") + b"\xff\xfe"),
+            ("合法 JSON 后紧跟非法 UTF-8 字节", b'{"duration": 1}\xff'),
+        ]
+
+    def assert_library_unchanged(self):
+        tracks = self.list_tracks()
+        # 数量与次序都与提交前一致。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.target_id, self.version["id"], self.other["id"]],
+        )
+        # 目标曲目、同一来源的另一版本、其他曲目的完整资料各自保留。
+        self.assertEqual(self.track_by_id(self.target_id), self.target)
+        self.assertEqual(self.track_by_id(self.version["id"]), self.version)
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+    def test_malformed_bodies_are_rejected_as_json_format_errors(self):
+        for label, body in self.malformed_bodies():
+            with self.subTest(label=label):
+                status, headers, raw = self.patch_bytes(self.target_id, body)
+                # 必须返回完整、可读的 400 JSON 错误响应：能读到状态行与
+                # 完整响应体（Content-Length 与实际字节一致），没有连接突然
+                # 断开，也不会出现保存成功的 200。
+                self.assert_json_format_error(status, headers, raw)
+                self.assert_library_unchanged()
+
+    def test_description_and_tags_keep_verbatim_after_all_failures(self):
+        for _, body in self.malformed_bodies():
+            self.patch_bytes(self.target_id, body)
+
+        record = self.track_by_id(self.target_id)
+        # 说明中的中文、结尾空格与连续空行逐字保留。
+        self.assertEqual(record["description"], self.target["description"])
+        self.assertTrue(record["description"].endswith("  \n\n"))
+        # 标签的完整文字与先后关系不变。
+        self.assertEqual(record["tags"], ["民谣", "现场版", "民谣（不插电）"])
+
+        tracks = self.list_tracks()
+        # 同一来源的多个独立版本仍各自保持原样，没有被合并或覆盖。
+        same_source = [t for t in tracks if t["source"] == "/music/yehang.flac"]
+        self.assertEqual(
+            [(t["id"], t["title"]) for t in same_source],
+            [(self.target_id, "夜航（首版）"),
+             (self.version["id"], "夜航（重制版）")],
+        )
+        self.assertEqual(
+            self.track_by_id(self.version["id"])["tags"], ["重制", "现场版"]
+        )
+
+    def test_rejected_content_is_not_completed_by_later_valid_patch(self):
+        # 多次夹带修改内容的格式错误被拒后，合法请求只保存本次明确提交的
+        # 资料，此前被拒绝的名称、说明不会自动补入。
+        status, _, _ = self.patch_bytes(
+            self.target_id,
+            '{"title": "不该补入的名称", "duration": 12'.encode("utf-8"),
+        )
+        self.assertEqual(status, 400)
+        status, _, _ = self.patch_bytes(
+            self.target_id,
+            '{"description": "不该补入的说明"}后面有文字'.encode("utf-8"),
+        )
+        self.assertEqual(status, 400)
+        status, _, _ = self.patch_bytes(
+            self.target_id, '{"tags": ["不该补入的标签"]'.encode("utf-8")
+        )
+        self.assertEqual(status, 400)
+
+        # 失败之后列表仍能正常读取，目标曲目仍能接受合法编辑。
+        status, body = self.patch(self.target_id, {"duration": 300})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body,
+            {
+                **self.target,
+                "duration": 300,
+            },
+        )
+        record = self.track_by_id(self.target_id)
+        self.assertEqual(record, body)
+        # 只改了明确提交的时长，被拒请求里的名称、说明与标签没有补入。
+        self.assertEqual(record["title"], self.target["title"])
+        self.assertEqual(record["description"], self.target["description"])
+        self.assertEqual(record["tags"], self.target["tags"])
+        # 其他记录同样不受这一连串失败影响。
+        self.assertEqual(self.track_by_id(self.version["id"]), self.version)
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+
+class EditNonObjectBodyTest(ServerTestCase):
+    """PATCH 体能解析成 JSON 但顶层不是对象：400、field=null，不保存。
+
+    此时问题在于整份资料的类型，而不是名称、时长等某个字段，因此错误
+    必须说明资料必须是 JSON 对象，field 为 null，也不能保存其中内容。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.create_track(
+            title="夜航（首版）",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明\n\n空行与中文保留",
+            tags=["民谣", "现场版"],
+        )
+        self.target_id = self.target["id"]
+        self.version = self.create_track(
+            title="夜航（重制版）",
+            source="/music/yehang.flac",
+            duration=250,
+            tags=["重制"],
+            save_as_new_version=True,
+        )
+        self.other = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+        )
+
+    def non_object_bodies(self):
+        return [
+            ("空数组", b"[]"),
+            ("非空数组", '["标签一", "标签二"]'.encode("utf-8")),
+            ("看起来像资料的对象数组", '[{"title": "不该保存的名称"}]'.encode("utf-8")),
+            ("字符串", '"夜航（新名称）"'.encode("utf-8")),
+            ("空字符串", b'""'),
+            ("整数字", b"42"),
+            ("小数字", b"243.5"),
+            ("数字零", b"0"),
+            ("布尔 true", b"true"),
+            ("布尔 false", b"false"),
+            ("null", b"null"),
+            # 顶层非有限数值在字段校验之前就因“不是对象”被拒，不能报时长错误。
+            ("顶层 NaN", b"NaN"),
+            ("顶层 Infinity", b"Infinity"),
+            ("顶层超大数字", b"1e999"),
+        ]
+
+    def assert_library_unchanged(self):
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.target_id, self.version["id"], self.other["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.target_id), self.target)
+        self.assertEqual(self.track_by_id(self.version["id"]), self.version)
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+    def test_non_object_bodies_are_rejected_with_null_field(self):
+        for label, body in self.non_object_bodies():
+            with self.subTest(label=label):
+                status, headers, raw = self.patch_bytes(self.target_id, body)
+                self.assert_json_object_required_error(status, headers, raw)
+                self.assert_library_unchanged()
+
+    def test_error_is_distinct_from_json_format_error(self):
+        # 同一标识连续发送两类请求体，调用者必须能区分两种 400：
+        # 无法解析 → 无效 JSON；可解析但非对象 → 必须是 JSON 对象。
+        status, headers, raw = self.patch_bytes(self.target_id, None)
+        self.assert_json_format_error(status, headers, raw)
+        format_error = json.loads(raw.decode("utf-8"))
+
+        status, headers, raw = self.patch_bytes(
+            self.target_id, '["标签"]'.encode("utf-8")
+        )
+        self.assert_json_object_required_error(status, headers, raw)
+        object_error = json.loads(raw.decode("utf-8"))
+
+        self.assertNotEqual(format_error["error"], object_error["error"])
+        self.assertNotIn("field", format_error)
+        self.assertIsNone(object_error["field"])
+
+    def test_non_object_content_is_not_saved_or_completed_later(self):
+        # 数组与字符串里看起来像新名称、新标签的内容都不能写入。
+        self.patch_bytes(
+            self.target_id, '[{"title": "不该保存的名称"}]'.encode("utf-8")
+        )
+        self.patch_bytes(
+            self.target_id, '"不该保存的名称"'.encode("utf-8")
+        )
+        self.patch_bytes(
+            self.target_id, '["不该保存的新标签"]'.encode("utf-8")
+        )
+        self.assertEqual(self.track_by_id(self.target_id), self.target)
+
+        # 之后只提交一个合法字段，保存的也只有这个字段。
+        status, body = self.patch(self.target_id, {"title": "夜航（修订）"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航（修订）")
+        self.assertEqual(body["source"], self.target["source"])
+        self.assertEqual(body["duration"], self.target["duration"])
+        self.assertEqual(body["description"], self.target["description"])
+        self.assertEqual(body["tags"], self.target["tags"])
+
+
+class EditNotFoundBodyHandlingTest(ServerTestCase):
+    """不存在的普通数字标识：先判 JSON 格式，再判曲目存在，不报告字段错误。"""
+
+    def setUp(self):
+        super().setUp()
+        self.existing = self.create_track(
+            title="存在的曲目",
+            source="/music/exists.flac",
+            duration=12,
+            description="不应被波及",
+            tags=["保留"],
+        )
+        # 普通数字标识：0 与远超现有数量的标识都不存在。
+        self.missing_ids = (0, self.existing["id"] + 1000)
+
+    def assert_not_found(self, status, raw, track_id):
+        self.assertEqual(status, 404, raw)
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body, {"error": f"曲目 #{track_id} 不存在"})
+        # 不存在时不继续做对象/字段校验：响应中没有 field，
+        # 也不出现“必须是 JSON 对象”之类的资料错误。
+        self.assertNotIn("field", body)
+        self.assertNotIn("JSON 对象", body["error"])
+
+    def test_unparseable_body_on_missing_id_is_json_format_error(self):
+        # 不存在的标识收到无法解析的请求体：先返回 400 的 JSON 格式错误。
+        for track_id in self.missing_ids:
+            for label, body in (
+                ("空请求体", None),
+                ("截断 JSON", b'{"title": "x"'),
+                ("纯文字", "不是 JSON".encode("utf-8")),
+                ("非法 UTF-8", b"\xff\xfe\xfa"),
+            ):
+                with self.subTest(track_id=track_id, label=label):
+                    status, headers, raw = self.patch_bytes(track_id, body)
+                    self.assert_json_format_error(status, headers, raw)
+
+    def test_parseable_non_object_body_on_missing_id_is_not_found(self):
+        # 请求体能够解析时，即使顶层不是对象，也返回 404 说明曲目不存在，
+        # 而不是 400 的“必须是 JSON 对象”。
+        for track_id in self.missing_ids:
+            for label, body in (
+                ("数组", b'["a", "b"]'),
+                ("字符串", '"名称"'.encode("utf-8")),
+                ("数字", b"42"),
+                ("布尔", b"true"),
+                ("null", b"null"),
+            ):
+                with self.subTest(track_id=track_id, label=label):
+                    status, _, raw = self.patch_bytes(track_id, body)
+                    self.assert_not_found(status, raw, track_id)
+
+    def test_object_body_with_bad_fields_on_missing_id_is_not_found(self):
+        # 即使对象里带有不合法字段，曲目不存在仍优先返回 404，
+        # 不继续报告字段错误。
+        for track_id in self.missing_ids:
+            for label, body in (
+                ("空对象", b"{}"),
+                ("字段类型错误", '{"duration": "不是数字"}'.encode("utf-8")),
+                ("字段值非法", b'{"title": "   ", "duration": -1}'),
+            ):
+                with self.subTest(track_id=track_id, label=label):
+                    status, _, raw = self.patch_bytes(track_id, body)
+                    self.assert_not_found(status, raw, track_id)
+
+    def test_existing_track_and_listing_still_work_after_missing_id_failures(self):
+        # 针对不存在标识的失败不影响已有曲目，列表照常读取。
+        self.patch_bytes(
+            self.missing_ids[-1], "不是 JSON".encode("utf-8")
+        )
+        self.patch_bytes(self.missing_ids[-1], b"[1, 2]")
+        self.patch_bytes(self.missing_ids[-1], b'{"duration": -1}')
+
+        tracks = self.list_tracks()
+        self.assertEqual(
+            [t["id"] for t in tracks], [self.existing["id"]]
+        )
+        self.assertEqual(
+            self.track_by_id(self.existing["id"]), self.existing
+        )
+        status, body = self.patch(self.existing["id"], {"duration": 88})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["duration"], 88)
+        self.assertEqual(body["title"], self.existing["title"])
+
+
+class EditValidBodyControlTest(ServerTestCase):
+    """合法请求对照：部分修改与空对象成功（200），空请求体失败（400）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="原说明\n\n保留空行",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=3,
+        )
+
+    def test_empty_body_and_empty_object_have_distinct_results(self):
+        # 空请求体：不是有效的 JSON，返回 400，原记录完整保留。
+        for body in (None, b""):
+            with self.subTest(body=body):
+                status, headers, raw = self.patch_bytes(self.track_id, body)
+                self.assert_json_format_error(status, headers, raw)
+                self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+        # 空对象 {}：合法的部分修改（没有字段需要更新），返回 200，
+        # 原记录同样完整保留。两者必须有各自明确的结果。
+        status, body = self.patch(self.track_id, {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, self.track)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+    def test_partial_update_returns_full_record_and_changes_only_submitted(self):
+        status, body = self.patch(self.track_id, {
+            "title": "夜航（修订）",
+            "tags": ["新标签"],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body,
+            {
+                **self.track,
+                "title": "夜航（修订）",
+                "tags": ["新标签"],
+            },
+        )
+        # 未提交的来源、时长、封面、说明保留旧值，标识不变。
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual(body["source"], self.track["source"])
+        self.assertEqual(body["duration"], self.track["duration"])
+        self.assertEqual(body["cover_url"], self.track["cover_url"])
+        self.assertEqual(body["description"], self.track["description"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        # 不新增记录、列表次序不变，其他曲目不受影响。
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.track_id, self.bystander["id"]],
+        )
+        self.assertEqual(
+            self.track_by_id(self.bystander["id"]), self.bystander
+        )
+
+    def test_failures_then_valid_edit_and_listing_all_work(self):
+        # 两类失败之后，列表仍能正常读取，已有曲目仍能接受合法编辑。
+        status, _, _ = self.patch_bytes(
+            self.track_id, '{"title": 截断'.encode("utf-8")
+        )
+        self.assertEqual(status, 400)
+        status, _, _ = self.patch_bytes(
+            self.track_id, '["不是对象"]'.encode("utf-8")
+        )
+        self.assertEqual(status, 400)
+
+        self.assertEqual(
+            [t["id"] for t in self.list_tracks()],
+            [self.track_id, self.bystander["id"]],
+        )
+        status, body = self.patch(self.track_id, {"description": "新的说明"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["description"], "新的说明")
+        # 其他字段仍是原值，失败内容没有混入。
+        self.assertEqual(body["title"], self.track["title"])
+        self.assertEqual(body["duration"], self.track["duration"])
 
 
 if __name__ == "__main__":
