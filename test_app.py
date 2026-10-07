@@ -4441,6 +4441,378 @@ class EditCoverApiCompatibilityTest(ServerTestCase):
         )
 
 
+class EditCoverApiOmitClearTest(ServerTestCase):
+    """省略 cover_url 保留原地址；空串/纯空白/null 是主动清空，保存为空串。
+
+    原本有地址、原本为空的曲目都遵守相同规则；清空与同次提交的
+    其他合法资料一起保存。
+    """
+
+    def make_track(self, cover_url, **fields):
+        # 每条曲目使用独立来源，避免准备数据时触发来源重复冲突。
+        self._source_seq = getattr(self, "_source_seq", 0) + 1
+        fields.setdefault("source", f"/music/cover-{self._source_seq}.flac")
+        return self.create_track(title="曲目", cover_url=cover_url, **fields)
+
+    # -- 修改其他合法资料但省略 cover_url：原地址完整保留 -------------------
+
+    def test_omitting_cover_keeps_existing_address(self):
+        track = self.make_track("https://img.example/甲 乙.png")
+        status, body = self.patch(track["id"], {
+            "title": "新名称",
+            "duration": 12,
+            "description": "新说明",
+            "tags": ["新标签"],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["cover_url"], "https://img.example/甲 乙.png")
+        self.assertEqual(
+            self.track_by_id(track["id"])["cover_url"],
+            "https://img.example/甲 乙.png",
+        )
+        # 同次提交的其他合法资料正常保存。
+        self.assertEqual(body["title"], "新名称")
+        self.assertEqual(body["duration"], 12)
+        self.assertEqual(body["description"], "新说明")
+        self.assertEqual(body["tags"], ["新标签"])
+
+    def test_omitting_cover_keeps_multiline_address_verbatim(self):
+        original = "第一段\r\n第二行  保留\n\n第三段"
+        track = self.make_track(original)
+        status, body = self.patch(track["id"], {"title": "只改名称"})
+        self.assertEqual(status, 200, body)
+        # 省略 cover_url 时原地址逐字节保留，包括原有换行写法与内部空格。
+        self.assertEqual(body["cover_url"], original)
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], original)
+
+    def test_omitting_cover_keeps_empty(self):
+        track = self.make_track("")
+        status, body = self.patch(track["id"], {"duration": 5})
+        self.assertEqual(status, 200, body)
+        # 原来为空的继续为空，不会被填上别的内容。
+        self.assertEqual(body["cover_url"], "")
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], "")
+
+    def test_empty_patch_body_keeps_cover(self):
+        track = self.make_track("https://img.example/stay.png")
+        status, body = self.patch(track["id"], {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, track)
+
+    # -- 明确清空：空串、纯空白字符串、null 都保存为空字符串 ------------------
+
+    def assert_clearing_saves_empty_string(self, submitted, original):
+        track = self.make_track(original)
+        status, body = self.patch(track["id"], {"cover_url": submitted})
+        self.assertEqual(status, 200, body)
+        # 主动清空保存为空字符串：不是 null，也不再返回旧地址。
+        self.assertEqual(body["cover_url"], "")
+        self.assertIsNotNone(body["cover_url"])
+        self.assertEqual(self.track_by_id(track["id"])["cover_url"], "")
+
+    def test_empty_string_clears_existing_address(self):
+        self.assert_clearing_saves_empty_string(
+            "", "https://img.example/old.png"
+        )
+
+    def test_whitespace_only_clears_existing_address(self):
+        for blank in (" ", "   ", "\t", "\n", "\r\n", " \n\t\n "):
+            with self.subTest(blank=repr(blank)):
+                self.assert_clearing_saves_empty_string(
+                    blank, "https://img.example/old.png"
+                )
+
+    def test_null_clears_existing_address(self):
+        self.assert_clearing_saves_empty_string(
+            None, "https://img.example/old.png"
+        )
+
+    def test_clearing_already_empty_cover_stays_empty(self):
+        # 原本没有地址的曲目同样接受这些提交，结果仍为空字符串。
+        for submitted in ("", "  \n ", None):
+            with self.subTest(submitted=repr(submitted)):
+                self.assert_clearing_saves_empty_string(submitted, "")
+
+    def test_clearing_saves_other_fields_in_same_request(self):
+        track = self.make_track(
+            "https://img.example/old.png",
+            duration=10,
+            description="原说明",
+        )
+        status, body = self.patch(track["id"], {
+            "cover_url": None,
+            "title": "清空封面版",
+            "duration": 20,
+        })
+        self.assertEqual(status, 200, body)
+        # 清空地址与同次提交的其他合法资料一起保存。
+        self.assertEqual(body["cover_url"], "")
+        self.assertEqual(body["title"], "清空封面版")
+        self.assertEqual(body["duration"], 20)
+        # 未提交的说明保留原值。
+        self.assertEqual(body["description"], "原说明")
+        self.assertEqual(self.track_by_id(track["id"]), body)
+
+
+class EditCoverApiVerbatimTest(ServerTestCase):
+    """非空封面地址按一段文字保存：只裁整段首尾空白，其余逐字节保留。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航", source="/music/yehang.flac",
+            cover_url="https://img.example/old.png",
+        )
+        self.track_id = self.track["id"]
+
+    def assert_cover_saved_verbatim(self, submitted, expected):
+        status, body = self.patch(self.track_id, {"cover_url": submitted})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["cover_url"], expected)
+        # 列表随后读到的记录与本次响应一致。
+        self.assertEqual(
+            self.track_by_id(self.track_id)["cover_url"], expected
+        )
+
+    def test_chinese_quotes_and_angle_brackets_kept(self):
+        text = '封面《夜航》"特别版" <不是标签>'
+        self.assert_cover_saved_verbatim(text, text)
+
+    def test_internal_spaces_and_blank_lines_kept(self):
+        self.assert_cover_saved_verbatim(
+            "第一段  保留空格\n\n第二段",
+            "第一段  保留空格\n\n第二段",
+        )
+
+    def test_internal_newline_styles_kept_verbatim(self):
+        # 接口提交的内部换行不套用网页表单的换行转换：
+        # LF/CRLF/CR 写法逐字节保留。
+        self.assert_cover_saved_verbatim("甲\n乙\r\n丙\r丁", "甲\n乙\r\n丙\r丁")
+
+    def test_only_outer_whitespace_trimmed(self):
+        self.assert_cover_saved_verbatim(
+            " \t\n 内部  保留 \r\n ",
+            "内部  保留",
+        )
+
+    def test_not_split_into_multiple_addresses(self):
+        # 封面地址是一段资料：含逗号、空白或换行的整段文字仍是一个地址。
+        text = "https://a/one.png, https://a/two.png\nhttps://a/three.png"
+        self.assert_cover_saved_verbatim(text, text)
+
+    def test_not_rejected_for_not_looking_like_url(self):
+        # 不因看起来不像网址而拒绝保存。
+        for text in ("不是网址", "本地文件 封面.PNG", "???", "ftp 也不检查"):
+            with self.subTest(text=text):
+                self.assert_cover_saved_verbatim(text, text)
+
+
+class EditCoverApiOnlyFieldTest(ServerTestCase):
+    """PATCH 只提交 cover_url：200 与完整曲目，列表一致、标识与顺序不变。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="原说明",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+            cover_url="https://img.example/other.png",
+        )
+
+    def test_cover_only_patch_returns_full_updated_record(self):
+        status, body = self.patch(self.track_id, {
+            "cover_url": "https://img.example/new.png",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual(body["cover_url"], "https://img.example/new.png")
+        # 未提交的名称、来源、时长、说明和标签都保留原值。
+        self.assertEqual(body["title"], self.track["title"])
+        self.assertEqual(body["source"], self.track["source"])
+        self.assertEqual(body["duration"], self.track["duration"])
+        self.assertEqual(body["description"], self.track["description"])
+        self.assertEqual(body["tags"], self.track["tags"])
+
+    def test_list_read_matches_response_and_order_unchanged(self):
+        before_ids = [t["id"] for t in self.list_tracks()]
+        status, body = self.patch(self.track_id, {
+            "cover_url": "https://img.example/new.png",
+        })
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        # 曲目标识、记录数量和原有排列次序不变。
+        self.assertEqual([t["id"] for t in tracks], before_ids)
+        self.assertEqual(len(tracks), 2)
+        # 列表随后读到的记录与修改响应一致。
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        # 其他曲目不受影响。
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+
+class EditCoverApiSameSourceVersionsTest(ServerTestCase):
+    """同一来源的多个版本：修改其中一条的封面地址，只影响选中的记录。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            cover_url="https://img.example/first.png",
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            cover_url="https://img.example/second.png",
+            save_as_new_version=True,
+        )
+
+    def test_edit_cover_with_shared_source_succeeds(self):
+        # 其他版本与当前曲目共用同一来源时，修改封面地址仍可成功。
+        status, body = self.patch(self.second["id"], {
+            "cover_url": "https://img.example/second-new.png",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.second["id"])
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["cover_url"], "https://img.example/second-new.png")
+
+    def test_other_version_untouched(self):
+        status, body = self.patch(self.second["id"], {
+            "cover_url": "https://img.example/second-new.png",
+        })
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        # 记录数量与列表顺序不变，仍是各自独立的记录。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.first["id"], self.second["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.second["id"]), body)
+        # 共用同一来源的其他版本完整资料不受影响。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+
+    def test_clear_one_versions_cover_leaves_others_intact(self):
+        status, body = self.patch(self.first["id"], {"cover_url": ""})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["cover_url"], "")
+        self.assertEqual(self.track_by_id(self.first["id"])["cover_url"], "")
+        self.assertEqual(
+            self.track_by_id(self.second["id"])["cover_url"],
+            "https://img.example/second.png",
+        )
+
+
+class EditCoverApiInvalidTypeTest(ServerTestCase):
+    """PATCH cover_url 误传非字符串类型：400 且 field=cover_url，整单失败。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="原说明",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac",
+            cover_url="https://img.example/other.png",
+        )
+
+    def assert_cover_rejected(self, payload):
+        """非法 cover_url（连同合法的新名称等资料）必须整单失败。"""
+        status, body = self.patch(self.track_id, payload)
+        self.assertEqual(status, 400, body)
+        # field 指向 cover_url，错误文字明确指出封面地址类型有误。
+        self.assertEqual(body["field"], "cover_url")
+        self.assertIn("封面地址", body["error"])
+
+    def assert_everything_unchanged(self):
+        tracks = self.list_tracks()
+        # 不新增记录、不改变列表顺序。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.bystander["id"]],
+        )
+        # 目标曲目的完整资料保持提交前的结果：同次请求里合法的新名称
+        # 或时长没有先写入，原封面地址仍在。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 其他曲目不受影响。
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+
+    def test_number_types_are_rejected(self):
+        for bad in (0, 1, 243, 243.5, -3):
+            with self.subTest(bad=bad):
+                self.assert_cover_rejected({"cover_url": bad})
+                self.assert_everything_unchanged()
+
+    def test_booleans_are_rejected(self):
+        for bad in (True, False):
+            with self.subTest(bad=bad):
+                self.assert_cover_rejected({"cover_url": bad})
+                self.assert_everything_unchanged()
+
+    def test_array_and_object_are_rejected(self):
+        for bad in ([], ["https://img.example/a.png"], {},
+                    {"url": "https://img.example/a.png"}):
+            with self.subTest(bad=bad):
+                self.assert_cover_rejected({"cover_url": bad})
+                self.assert_everything_unchanged()
+
+    def test_invalid_cover_with_valid_title_and_duration_saves_nothing(self):
+        # 即使同次请求还提交了合法的新名称与时长，也不能保存其中任何一部分。
+        self.assert_cover_rejected({
+            "title": "不应保存的新名称",
+            "duration": 300,
+            "cover_url": 123,
+        })
+        self.assert_everything_unchanged()
+        # 明确核对原封面地址仍在，而不是部分修改后的结果。
+        self.assertEqual(
+            self.track_by_id(self.track_id)["cover_url"],
+            "https://img.example/yehang.png",
+        )
+
+    def test_valid_cover_with_negative_duration_rejected_as_a_whole(self):
+        # 封面地址合法但同次提交的时长不合法：整次拒绝，错误指向时长，
+        # 原封面地址仍保留。
+        status, body = self.patch(self.track_id, {
+            "cover_url": "https://img.example/new.png",
+            "duration": -1,
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "duration")
+        self.assert_everything_unchanged()
+
+    def test_legal_request_after_type_error_saves_normally(self):
+        # 类型错误被拒后，用同一标识提交合法地址可以正常保存；
+        # 失败请求里的内容不会被补入。
+        status, body = self.patch(self.track_id, {
+            "title": "不应保存的名称",
+            "cover_url": False,
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "cover_url")
+
+        status, body = self.patch(self.track_id, {
+            "cover_url": "https://img.example/fixed.png",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["cover_url"], "https://img.example/fixed.png")
+        # 名称没有被失败请求改动。
+        self.assertEqual(body["title"], self.track["title"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
+
+
 class SourceApiNewlinePreservationTest(ServerTestCase):
     """接口收录与接口编辑：来源只去首尾空白，内部换行写法逐字节保留。"""
 
