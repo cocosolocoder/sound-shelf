@@ -110,6 +110,22 @@
   新名称或其他资料，也不能保存其中任何一部分，目标曲目与其他曲目的已保存
   资料都保持提交前内容；null 的清空含义不能混入这些类型错误，失败后列表
   仍看到原说明而不出现部分修改或额外记录。
+- 名称（PATCH title，直接提交 JSON）：提交合法的新名称返回 200 与修改后的
+  完整曲目，更新的仍是原来的标识；列表中该条记录的名称与成功响应一致，
+  不增加曲目，也不改变列表按标识升序的关系。名称只去掉整段首尾空白，
+  中文、引号、尖括号、内部连续空格和空行都是实际内容，按普通文字保存，
+  不能被合并或删除；接口提交的内部 LF、CRLF 或单独 CR 换行各自按原文
+  保存，不能因为网页编辑会统一换行就把接口输入也改写成 LF；用户确实
+  修改名称内部文字或分行后，读回的名称包含本次改动。省略 title、只修改
+  合法的说明时名称完整保留（含原有内部换行写法）；只提交新名称时则采用
+  本次名称，来源、时长、封面、说明和标签保留原值。已有多个版本共用同一
+  来源时，单独给其中一个版本改名仍然成功，不误报来源冲突，其他版本的
+  名称和资料不受影响；名称相同的不同曲目也继续保持各自的标识，改名不会
+  把记录合并。名称为空字符串、只含空格、制表符或换行，或者提交 null、
+  数字、布尔值、数组、对象时返回 400，field 指向 title，错误文字说明
+  名称有误；即使同次请求还提交了合法的新说明，也不能先保存说明或其他
+  部分内容，目标曲目与其他曲目的完整资料、数量及列表顺序都保持提交前
+  的结果。
 - 编辑页（GET/POST /tracks/{id}/edit）的标签每个标签项一个输入框：
   接口收录时按完整文字保存的标签（可含换行、中英文逗号、顿号）逐框展示，
   直接保存或仅改名称不拆不并不丢；增删改只影响对应框，裁剪、忽略空项、
@@ -7344,6 +7360,514 @@ class EditDescriptionApiInvalidTypeTest(ServerTestCase):
                 self.assertEqual(status, 400, body)
                 self.assertEqual(body["field"], "description")
                 self.assert_everything_unchanged()
+
+
+class EditTitleApiValidRenameTest(ServerTestCase):
+    """PATCH title 提交合法新名称：200、完整曲目、原标识，列表一致且不增记录。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="夜航现场录音",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="无关曲目", source="/music/other.flac", duration=9,
+        )
+
+    def test_rename_returns_200_with_full_record(self):
+        status, body = self.patch(self.track_id, {"title": "夜航（新版）"})
+        self.assertEqual(status, 200, body)
+        # 成功响应是修改后的完整曲目，更新的仍是原来的标识。
+        self.assertEqual(body, {
+            "id": self.track_id,
+            "title": "夜航（新版）",
+            "source": "/music/yehang.flac",
+            "duration": 243.5,
+            "cover_url": "https://img.example/yehang.png",
+            "description": "夜航现场录音",
+            "tags": ["民谣", "现场"],
+        })
+
+    def test_listed_title_matches_success_response(self):
+        status, body = self.patch(self.track_id, {"title": "夜航（定稿）"})
+        self.assertEqual(status, 200, body)
+        # 列表中该条记录与成功响应完全一致。
+        self.assertEqual(self.track_by_id(self.track_id), body)
+        self.assertEqual(
+            self.track_by_id(self.track_id)["title"], "夜航（定稿）"
+        )
+
+    def test_rename_adds_no_record_and_keeps_id_ascending_order(self):
+        before_ids = [t["id"] for t in self.list_tracks()]
+        status, body = self.patch(self.track_id, {"title": "夜航（修订）"})
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        # 不增加曲目，列表仍按标识升序。
+        self.assertEqual(len(tracks), len(before_ids))
+        self.assertEqual([t["id"] for t in tracks], before_ids)
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            sorted(t["id"] for t in tracks),
+        )
+        self.assertEqual([t["id"] for t in tracks],
+                         [self.track_id, self.bystander["id"]])
+
+
+class EditTitleApiContentRulesTest(ServerTestCase):
+    """PATCH title 按文字保存：只裁整段首尾空白，内部内容与换行写法逐字保留。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="原名称",
+            source="/music/title.flac",
+            duration=243.5,
+            cover_url="https://img.example/old.png",
+            description="旧说明",
+            tags=["旧标签"],
+        )
+        self.track_id = self.track["id"]
+
+    def assert_title_saved_verbatim(self, submitted, expected):
+        """提交 title，断言响应与列表读到的名称都等于 expected。"""
+        status, body = self.patch(self.track_id, {"title": submitted})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual(
+            body["title"], expected,
+            "成功响应的名称与保存结果不一致：\n  实际=%r\n  期望=%r"
+            % (body["title"], expected),
+        )
+        listed = self.track_by_id(self.track_id)["title"]
+        self.assertEqual(
+            listed, expected,
+            "列表读到的名称与保存结果不一致：\n  实际=%r\n  期望=%r"
+            % (listed, expected),
+        )
+        return body
+
+    def test_chinese_quotes_and_angle_brackets_kept_as_plain_text(self):
+        # 中文、中英文引号、尖括号都是名称文字，不转义、不删除、不合并。
+        title = '夜航 “引号” 与 "双引号" 与 \'单引号\' <b>不是加粗</b>'
+        self.assert_title_saved_verbatim(title, title)
+
+    def test_html_looking_text_kept_as_plain_text(self):
+        # 看起来像网页标签的内容按普通文字保存。
+        title = "</textarea><script>alert(1)</script><看起来像标签>"
+        self.assert_title_saved_verbatim(title, title)
+
+    def test_internal_consecutive_spaces_kept(self):
+        # 内部连续空格不能被合并或删除。
+        self.assert_title_saved_verbatim("夜航  现场   版", "夜航  现场   版")
+
+    def test_internal_blank_lines_kept(self):
+        # 内部空行（连续换行）是实际内容，不能被折叠。
+        self.assert_title_saved_verbatim("夜航\n\n现场  版", "夜航\n\n现场  版")
+        self.assert_title_saved_verbatim("夜航\n\n\n空三行后", "夜航\n\n\n空三行后")
+
+    def test_only_surrounding_whitespace_is_trimmed(self):
+        # 只去掉整段首尾空白（空格、制表符、换行都算）。
+        self.assert_title_saved_verbatim(
+            "  \t 夜航\n现场  版 \n\t ", "夜航\n现场  版"
+        )
+
+    def test_lf_newlines_preserved_verbatim(self):
+        # 直接接口提交的 LF 换行原样保存，不做任何统一。
+        title = "夜航\n\n现场  版\n结尾行"
+        body = self.assert_title_saved_verbatim(title, title)
+        self.assertNotIn("\r", body["title"])
+
+    def test_crlf_newlines_preserved_verbatim(self):
+        # 直接接口提交的 CRLF 换行原样保留，不能套用网页表单的 LF 归一化。
+        title = "夜航\r\n\r\n现场  版\r\n结尾行"
+        body = self.assert_title_saved_verbatim(title, title)
+        self.assertIn("\r\n", body["title"])
+        self.assertNotIn("\n", body["title"].replace("\r\n", ""))
+
+    def test_cr_newlines_preserved_verbatim(self):
+        # 直接接口提交的旧式单独 CR 换行也原样保留。
+        title = "夜航\r现场  版\r结尾行"
+        body = self.assert_title_saved_verbatim(title, title)
+        self.assertIn("\r", body["title"])
+        self.assertNotIn("\n", body["title"])
+
+    def test_mixed_newline_styles_each_preserved(self):
+        # 同一段名称里混用 LF、CRLF、CR 时，三种写法各自保留。
+        title = "LF 行\n下一行\r\n再一行\rCR 行\n收尾"
+        self.assert_title_saved_verbatim(title, title)
+
+    def test_newline_style_variants_remain_distinct(self):
+        # 仅换行写法不同的两次改名保存为不同的名称，不会被统一成同一段。
+        lf_title = "夜航\n现场版"
+        crlf_title = "夜航\r\n现场版"
+        status, body = self.patch(self.track_id, {"title": lf_title})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], lf_title)
+        status, body = self.patch(self.track_id, {"title": crlf_title})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], crlf_title)
+        self.assertNotEqual(
+            self.track_by_id(self.track_id)["title"], lf_title
+        )
+
+    def test_internal_text_change_is_read_back(self):
+        # 用户确实修改名称内部文字后，读回的名称包含本次改动。
+        self.assert_title_saved_verbatim("夜航·重制版", "夜航·重制版")
+
+    def test_internal_line_break_change_is_read_back(self):
+        # 用户确实修改名称内部分行后，读回的分行与本次提交一致。
+        status, body = self.patch(self.track_id, {"title": "夜航\n现场  版"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航\n现场  版")
+        status, body = self.patch(self.track_id, {"title": "夜航现场  版"})
+        self.assertEqual(status, 200, body)
+        # 删去内部分行属于真实改动，读回不再包含换行。
+        self.assertEqual(body["title"], "夜航现场  版")
+        self.assertNotIn("\n", body["title"])
+
+
+class EditTitleApiPartialUpdateTest(ServerTestCase):
+    """局部修改：省略 title 改名不影响名称；只改名称其他资料保留原值。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航\n现场  版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="旧说明\n第二行",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+
+    def test_omitting_title_with_valid_description_keeps_title_bytes(self):
+        new_description = "新的说明\n第二行：鸟鸣"
+        status, body = self.patch(self.track_id, {
+            "description": new_description,
+        })
+        self.assertEqual(status, 200, body)
+        # 省略 title：名称完整保留，包括原有的内部换行写法。
+        self.assertEqual(body["title"], "夜航\n现场  版")
+        self.assertEqual(
+            self.track_by_id(self.track_id)["title"], "夜航\n现场  版"
+        )
+        self.assertEqual(body["description"], new_description)
+
+    def test_omitting_title_keeps_crlf_and_cr_newline_styles(self):
+        for name, raw in (
+            ("crlf", "夜航\r\n现场  版"),
+            ("cr", "夜航\r现场  版"),
+        ):
+            with self.subTest(style=name):
+                track = self.create_track(
+                    title=raw, source=f"/music/{name}.flac",
+                )
+                status, body = self.patch(track["id"], {
+                    "description": "只改说明",
+                })
+                self.assertEqual(status, 200, body)
+                # 原有内部换行写法逐字节保留，没有被网页式 LF 归一化影响。
+                self.assertEqual(
+                    body["title"], raw,
+                    "名称换行写法被改写：\n  实际=%r\n  原文=%r"
+                    % (body["title"], raw),
+                )
+                self.assertEqual(
+                    self.track_by_id(track["id"])["title"], raw
+                )
+
+    def test_title_only_keeps_all_other_fields(self):
+        new_title = "夜航（新版）"
+        status, body = self.patch(self.track_id, {"title": new_title})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.track_id)
+        self.assertEqual(body["title"], new_title)
+        # 来源、时长、封面、说明和标签保留原值。
+        self.assertEqual(body["source"], self.track["source"])
+        self.assertEqual(body["duration"], self.track["duration"])
+        self.assertEqual(body["cover_url"], self.track["cover_url"])
+        self.assertEqual(body["description"], self.track["description"])
+        self.assertEqual(body["tags"], self.track["tags"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
+
+    def test_empty_patch_body_changes_nothing(self):
+        status, body = self.patch(self.track_id, {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+
+    def test_omitting_title_when_changing_other_fields_round_trips(self):
+        # 省略 title 同时修改多个合法字段，名称仍逐字保留，其余修改生效。
+        status, body = self.patch(self.track_id, {
+            "duration": 300,
+            "tags": ["新标签"],
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航\n现场  版")
+        self.assertEqual(body["duration"], 300)
+        self.assertEqual(body["tags"], ["新标签"])
+        # 未提交的来源、封面、说明也仍是原值。
+        self.assertEqual(body["source"], self.track["source"])
+        self.assertEqual(body["cover_url"], self.track["cover_url"])
+        self.assertEqual(body["description"], self.track["description"])
+
+
+class EditTitleApiSameSourceVersionsTest(ServerTestCase):
+    """同一来源的多个版本：只给其中一个改名不误报冲突，其他版本不受影响。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.create_track(
+            title="夜航·首版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="首版说明",
+            tags=["民谣", "现场"],
+        )
+        self.second = self.create_track(
+            title="夜航·重制",
+            source="/music/yehang.flac",
+            duration=250,
+            cover_url="https://img.example/yehang-remaster.png",
+            description="重制说明",
+            tags=["民谣", "重制"],
+            save_as_new_version=True,
+        )
+        self.other = self.create_track(
+            title="别的来源", source="/music/other.flac",
+        )
+
+    def test_rename_one_version_succeeds_without_conflict(self):
+        status, body = self.patch(self.second["id"], {
+            "title": "夜航·重制（修订）",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], self.second["id"])
+        # 来源未改，只改名称不会触发同来源冲突；来源仍是共用的那一个。
+        self.assertEqual(body["source"], "/music/yehang.flac")
+        self.assertEqual(body["title"], "夜航·重制（修订）")
+
+    def test_other_versions_full_records_untouched(self):
+        status, body = self.patch(self.second["id"], {
+            "title": "夜航·重制（修订）",
+        })
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        # 记录数量与列表顺序不变，两个版本仍是各自独立的记录。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.first["id"], self.second["id"], self.other["id"]],
+        )
+        self.assertEqual(self.track_by_id(self.second["id"]), body)
+        # 同一来源的其他版本名称与完整资料不受影响。
+        self.assertEqual(self.track_by_id(self.first["id"]), self.first)
+        # 其他来源的曲目也不受影响。
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+    def test_rename_every_version_independently(self):
+        status, body = self.patch(self.first["id"], {"title": "夜航·首版（定名）"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航·首版（定名）")
+        status, body = self.patch(self.second["id"], {
+            "title": "夜航·重制\r\n保留 CRLF",
+        })
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航·重制\r\n保留 CRLF")
+        # 两个版本的改名互不干扰，第三个曲目不变。
+        self.assertEqual(
+            self.track_by_id(self.first["id"])["title"], "夜航·首版（定名）"
+        )
+        self.assertEqual(
+            self.track_by_id(self.second["id"])["title"],
+            "夜航·重制\r\n保留 CRLF",
+        )
+        self.assertEqual(self.track_by_id(self.first["id"])["source"],
+                         "/music/yehang.flac")
+        self.assertEqual(self.track_by_id(self.second["id"])["source"],
+                         "/music/yehang.flac")
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+
+class EditTitleApiSameNameRecordsTest(ServerTestCase):
+    """名称相同的不同曲目保持各自标识，改名不会把记录合并。"""
+
+    def test_same_name_records_keep_distinct_ids(self):
+        first = self.create_track(title="同名曲目", source="/music/a.flac")
+        second = self.create_track(title="同名曲目", source="/music/b.flac")
+        self.assertNotEqual(first["id"], second["id"])
+
+        status, body = self.patch(first["id"], {"title": "改了名字的曲目"})
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        # 改名后仍是两条独立记录，数量与顺序不变，记录没有被合并。
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual([t["id"] for t in tracks],
+                         [first["id"], second["id"]])
+        self.assertEqual(
+            self.track_by_id(first["id"])["title"], "改了名字的曲目"
+        )
+        self.assertEqual(self.track_by_id(second["id"])["title"], "同名曲目")
+
+    def test_renaming_to_another_tracks_title_does_not_merge(self):
+        first = self.create_track(title="名称甲", source="/music/a.flac")
+        second = self.create_track(title="名称乙", source="/music/b.flac")
+        # 把第一条改成与第二条完全相同的名称：各自标识仍在，不合并。
+        status, body = self.patch(first["id"], {"title": "名称乙"})
+        self.assertEqual(status, 200, body)
+        tracks = self.list_tracks()
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual(
+            [t["id"] for t in tracks], [first["id"], second["id"]]
+        )
+        self.assertEqual(self.track_by_id(first["id"]), body)
+        self.assertEqual(self.track_by_id(first["id"])["title"], "名称乙")
+        self.assertEqual(self.track_by_id(second["id"])["title"], "名称乙")
+        self.assertEqual(
+            self.track_by_id(first["id"])["source"], "/music/a.flac"
+        )
+        self.assertEqual(
+            self.track_by_id(second["id"])["source"], "/music/b.flac"
+        )
+
+
+class EditTitleApiInvalidTest(ServerTestCase):
+    """PATCH title 为空/纯空白/非法类型：400 且 field=title，整单失败不落库。"""
+
+    def setUp(self):
+        super().setUp()
+        self.track = self.create_track(
+            title="夜航\n现场  版",
+            source="/music/yehang.flac",
+            duration=243.5,
+            cover_url="https://img.example/yehang.png",
+            description="原说明\n第二行",
+            tags=["民谣", "现场"],
+        )
+        self.track_id = self.track["id"]
+        self.bystander = self.create_track(
+            title="同一来源另一版本",
+            source="/music/yehang.flac",
+            duration=250,
+            description="不应受影响",
+            tags=["其他"],
+            save_as_new_version=True,
+        )
+        self.other = self.create_track(
+            title="别的来源", source="/music/other.flac",
+        )
+
+    def assert_title_rejected(self, payload):
+        status, body = self.patch(self.track_id, payload)
+        self.assertEqual(status, 400, body)
+        # field 指向 title，错误文字说明名称有误。
+        self.assertEqual(body["field"], "title")
+        self.assertIn("名称", body["error"])
+
+    def assert_everything_unchanged(self):
+        tracks = self.list_tracks()
+        # 记录数量与列表按标识升序的顺序保持提交前结果。
+        self.assertEqual(
+            [t["id"] for t in tracks],
+            [self.track_id, self.bystander["id"], self.other["id"]],
+        )
+        # 目标曲目完整资料保持提交前内容。
+        self.assertEqual(self.track_by_id(self.track_id), self.track)
+        # 同一来源的其他版本与其他来源曲目都不受影响。
+        self.assertEqual(self.track_by_id(self.bystander["id"]), self.bystander)
+        self.assertEqual(self.track_by_id(self.other["id"]), self.other)
+
+    def test_empty_string_is_rejected(self):
+        self.assert_title_rejected({"title": ""})
+        self.assert_everything_unchanged()
+
+    def test_whitespace_only_strings_are_rejected(self):
+        for bad in (" ", "   ", "\t", "\t\t ", "\n", "\r", "\r\n",
+                    " \t\n\r ", "\n\n  \t\n"):
+            with self.subTest(bad=bad):
+                self.assert_title_rejected({"title": bad})
+                self.assert_everything_unchanged()
+
+    def test_null_is_rejected(self):
+        # 名称没有“清空”语义：null 也是名称错误，不能保存为空。
+        self.assert_title_rejected({"title": None})
+        self.assert_everything_unchanged()
+
+    def test_number_types_are_rejected(self):
+        for bad in (0, 1, 243, 243.5, -3):
+            with self.subTest(bad=bad):
+                self.assert_title_rejected({"title": bad})
+                self.assert_everything_unchanged()
+
+    def test_booleans_are_rejected(self):
+        for bad in (True, False):
+            with self.subTest(bad=bad):
+                self.assert_title_rejected({"title": bad})
+                self.assert_everything_unchanged()
+
+    def test_array_and_object_are_rejected(self):
+        for bad in ([], ["夜航"], {}, {"title": "夜航"}):
+            with self.subTest(bad=bad):
+                self.assert_title_rejected({"title": bad})
+                self.assert_everything_unchanged()
+
+    def test_invalid_title_with_valid_description_saves_nothing(self):
+        # 即使同次请求还提交了合法的新说明（以及其他合法资料），也不能
+        # 先保存说明或其他部分内容：整条记录保持提交前状态。
+        self.assert_title_rejected({
+            "title": "   ",
+            "description": "不应保存的新说明",
+            "duration": 300,
+            "tags": ["不应保存的新标签"],
+        })
+        self.assert_everything_unchanged()
+        self.assertEqual(
+            self.track_by_id(self.track_id)["description"], "原说明\n第二行"
+        )
+
+    def test_null_title_alongside_other_changes_saves_nothing(self):
+        self.assert_title_rejected({
+            "title": None,
+            "description": "不应保存的新说明",
+        })
+        self.assert_everything_unchanged()
+
+    def test_repeated_failures_leave_no_partial_change(self):
+        # 连续多种非法名称后，列表中仍是提交前的记录与原名称。
+        for bad in ("", "  \n\t", None, 123, True, ["x"], {"k": "v"}):
+            with self.subTest(bad=bad):
+                self.assert_title_rejected({
+                    "title": bad,
+                    "description": "反复失败时不应保存的说明",
+                })
+                self.assert_everything_unchanged()
+
+    def test_legal_request_after_rejection_saves_normally(self):
+        # 非法名称被拒后，用同一标识提交合法名称可正常保存；
+        # 失败请求里尝试一起改的说明不会被补入。
+        status, body = self.patch(self.track_id, {
+            "title": None,
+            "description": "失败请求里的新说明",
+        })
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["field"], "title")
+
+        status, body = self.patch(self.track_id, {"title": "夜航（定稿）"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["title"], "夜航（定稿）")
+        # 说明没有被失败请求改动，其余资料也保持原值。
+        self.assertEqual(body["description"], "原说明\n第二行")
+        self.assertEqual(body["source"], self.track["source"])
+        self.assertEqual(body["duration"], self.track["duration"])
+        self.assertEqual(body["cover_url"], self.track["cover_url"])
+        self.assertEqual(body["tags"], self.track["tags"])
+        self.assertEqual(self.track_by_id(self.track_id), body)
 
 
 if __name__ == "__main__":
