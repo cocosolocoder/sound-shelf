@@ -26,14 +26,73 @@ FIELD_LABELS = {
 
 TRACK_COLUMNS = "id, title, source, duration, cover_url, description, tags"
 
+# 两类 JSON 接口（收录 POST、编辑 PATCH）共用的请求体与冲突提示文字。
+BAD_JSON_MESSAGE = "请求体不是有效的 JSON"
+NOT_OBJECT_MESSAGE = "请求体必须是 JSON 对象"
+CREATE_SOURCE_CONFLICT_MESSAGE = (
+    "该来源已存在曲目记录；如确需另存为新版本，"
+    "请将 save_as_new_version 设为 true 后重试"
+)
+UPDATE_SOURCE_CONFLICT_MESSAGE = (
+    "该来源已被其他曲目使用；请修改来源后重试，或取消编辑后另存新版本"
+)
+
 
 class PayloadError(Exception):
-    """字段校验失败，field 为出错字段名。"""
+    """字段校验失败，field 为出错字段名。
+
+    field 为 None 表示问题出在请求体整体形状（顶层不是 JSON 对象），
+    不属于任何具体资料字段。
+    """
 
     def __init__(self, field, message):
         super().__init__(message)
         self.field = field
         self.message = message
+
+
+class RequestFormatError(Exception):
+    """请求体无法按 UTF-8 解码或不是有效的 JSON。"""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+def parse_json_body(raw):
+    """把原始请求字节解析成 JSON 值，收录与编辑入口共用。
+
+    空请求体、无法解析的 JSON 或不能按 UTF-8 解码的内容都抛
+    RequestFormatError（调用方统一回 400，错误不带 field）；
+    解析成功但顶层不是对象不在此判断，由 require_json_object 处理，
+    以便编辑入口对不存在的标识优先返回 404。
+    """
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RequestFormatError(BAD_JSON_MESSAGE)
+
+
+def require_json_object(data):
+    """顶层必须是 JSON 对象；否则抛 field 为 None 的 PayloadError。"""
+    if not isinstance(data, dict):
+        raise PayloadError(None, NOT_OBJECT_MESSAGE)
+
+
+def field_error_body(error):
+    """把字段校验失败拼成两个 JSON 入口一致的 400 响应体。
+
+    field 为 None（顶层形状问题）时只使用原始提示，并显式给出 null。
+    """
+    label = FIELD_LABELS.get(error.field)
+    message = f"{label}有误：{error.message}" if label else error.message
+    return {"error": message, "field": error.field}
+
+
+def source_conflict_body(message, conflicts):
+    """拼装来源重复冲突的 409 响应体，收录与编辑共用同一形状，
+    各自只传入本入口的提示文字。"""
+    return {"error": message, "field": "source", "existing": conflicts}
 
 
 def connect_database(path: Path) -> sqlite3.Connection:
@@ -148,8 +207,7 @@ def clean_payload(data):
     必填，选填资料未提交时使用默认值。任何不合法输入都抛
     PayloadError，且不会写入数据。
     """
-    if not isinstance(data, dict):
-        raise PayloadError(None, "请求体必须是 JSON 对象")
+    require_json_object(data)
 
     title = data.get("title")
     if title is None:
@@ -229,8 +287,7 @@ def clean_patch_payload(data):
     这里不补任何默认值。任何不合法输入都抛 PayloadError，
     且不会写入数据。
     """
-    if not isinstance(data, dict):
-        raise PayloadError(None, "请求体必须是 JSON 对象")
+    require_json_object(data)
 
     clean = {}
 
@@ -1014,27 +1071,20 @@ def main():
             self.respond(200, {RESOURCE: list_tracks(database)})
 
         def handle_api_post(self):
-            raw = self.read_body()
             try:
-                data = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.respond(400, {"error": "请求体不是有效的 JSON"})
+                data = parse_json_body(self.read_body())
+            except RequestFormatError as exc:
+                self.respond(400, {"error": exc.message})
                 return
             try:
                 record, conflicts = create_track(database, data)
             except PayloadError as exc:
-                label = FIELD_LABELS.get(exc.field)
-                message = f"{label}有误：{exc.message}" if label else exc.message
-                self.respond(400, {"error": message, "field": exc.field})
+                self.respond(400, field_error_body(exc))
                 return
             if conflicts is not None:
                 self.respond(
                     409,
-                    {
-                        "error": "该来源已存在曲目记录；如确需另存为新版本，请将 save_as_new_version 设为 true 后重试",
-                        "field": "source",
-                        "existing": conflicts,
-                    },
+                    source_conflict_body(CREATE_SOURCE_CONFLICT_MESSAGE, conflicts),
                 )
                 return
             self.respond(201, record)
@@ -1127,18 +1177,18 @@ def main():
             )
 
         def handle_api_patch(self, track_id):
-            raw = self.read_body()
+            # 顺序固定：请求体无法解析时先回格式 400（即使标识不存在）；
+            # 能解析时再由 update_track 判断曲目是否存在——不存在即 404，
+            # 哪怕顶层不是对象也不改报字段错误；存在时才做形状与字段校验。
             try:
-                data = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.respond(400, {"error": "请求体不是有效的 JSON"})
+                data = parse_json_body(self.read_body())
+            except RequestFormatError as exc:
+                self.respond(400, {"error": exc.message})
                 return
             try:
                 record, conflicts = update_track(database, track_id, data)
             except PayloadError as exc:
-                label = FIELD_LABELS.get(exc.field)
-                message = f"{label}有误：{exc.message}" if label else exc.message
-                self.respond(400, {"error": message, "field": exc.field})
+                self.respond(400, field_error_body(exc))
                 return
             if record is None:
                 if conflicts == "not_found":
@@ -1146,11 +1196,9 @@ def main():
                 else:
                     self.respond(
                         409,
-                        {
-                            "error": "该来源已被其他曲目使用；请修改来源后重试，或取消编辑后另存新版本",
-                            "field": "source",
-                            "existing": conflicts,
-                        },
+                        source_conflict_body(
+                            UPDATE_SOURCE_CONFLICT_MESSAGE, conflicts
+                        ),
                     )
                 return
             self.respond(200, record)
